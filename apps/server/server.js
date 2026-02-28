@@ -66,13 +66,21 @@ api.get('/live', (_req, res) => {
 		return res.json({
 			data: null,
 			data_warning: null,
+			explanation: null,
 			message: 'No readings yet',
 		});
 	}
 
+	const data = withDerivedValues(row);
+	const explanation = getLiveExplanation(data);
+
 	return res.json({
-		data: withDerivedValues(row),
+		data: {
+			...data,
+			explanation,
+		},
 		data_warning: state.liveDataWarning,
+		explanation,
 	});
 });
 
@@ -250,6 +258,22 @@ function withDerivedValues(row) {
 		grid_net_w: gridNet,
 		self_consumed_w: selfConsumed,
 	};
+}
+
+function getLiveExplanation(reading) {
+	if (reading.pv_w > 500 && reading.grid_import_w > 200 && reading.load_w > reading.pv_w) {
+		return `Importing because load (${reading.load_w}W) exceeds solar (${reading.pv_w}W).`;
+	}
+
+	if (reading.grid_export_w > 0) {
+		return `Exporting surplus solar (${reading.grid_export_w}W).`;
+	}
+
+	if (reading.grid_import_w > 0) {
+		return `Importing from grid (${reading.grid_import_w}W).`;
+	}
+
+	return null;
 }
 
 function startPolling() {
