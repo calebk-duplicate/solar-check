@@ -97,19 +97,11 @@ api.get('/history', (req, res) => {
 });
 
 api.get('/daily', (req, res) => {
-	const range = parseRange(req.query.from, req.query.to, 30);
-	recomputeDailyAggForRange(db, statements, range.from, range.to);
+	const range = parseRange(req.query.from, req.query.to, 24 * 7);
+	const readings = statements.getHistoryInRange.all(range.from, range.to);
+	const daily = aggregateDailyFromReadings(readings);
 
-	const fromDay = range.from.slice(0, 10);
-	const toDay = range.to.slice(0, 10);
-	const rows = statements.getDailyRange.all(fromDay, toDay);
-
-	res.json({
-		from: fromDay,
-		to: toDay,
-		count: rows.length,
-		data: rows,
-	});
+	res.json(daily);
 });
 
 app.use('/api', api);
@@ -258,6 +250,56 @@ function withDerivedValues(row) {
 		grid_net_w: gridNet,
 		self_consumed_w: selfConsumed,
 	};
+}
+
+function aggregateDailyFromReadings(rows) {
+	const dailyMap = new Map();
+
+	for (let index = 1; index < rows.length; index += 1) {
+		const prev = rows[index - 1];
+		const curr = rows[index];
+
+		const prevTs = Date.parse(prev.ts_utc);
+		const currTs = Date.parse(curr.ts_utc);
+		if (!Number.isFinite(prevTs) || !Number.isFinite(currTs) || currTs <= prevTs) {
+			continue;
+		}
+
+		const deltaSeconds = (currTs - prevTs) / 1000;
+		const factor = deltaSeconds / 3600 / 1000;
+		const day = curr.ts_utc.slice(0, 10);
+
+		if (!dailyMap.has(day)) {
+			dailyMap.set(day, {
+				day,
+				pv_kwh: 0,
+				load_kwh: 0,
+				import_kwh: 0,
+				export_kwh: 0,
+				self_kwh: 0,
+			});
+		}
+
+		const bucket = dailyMap.get(day);
+		const selfW = Math.max(0, prev.load_w - prev.grid_import_w);
+
+		bucket.pv_kwh += prev.pv_w * factor;
+		bucket.load_kwh += prev.load_w * factor;
+		bucket.import_kwh += prev.grid_import_w * factor;
+		bucket.export_kwh += prev.grid_export_w * factor;
+		bucket.self_kwh += selfW * factor;
+	}
+
+	return Array.from(dailyMap.values())
+		.sort((a, b) => a.day.localeCompare(b.day))
+		.map((item) => ({
+			day: item.day,
+			pv_kwh: round3(item.pv_kwh),
+			load_kwh: round3(item.load_kwh),
+			import_kwh: round3(item.import_kwh),
+			export_kwh: round3(item.export_kwh),
+			self_kwh: round3(item.self_kwh),
+		}));
 }
 
 function getLiveExplanation(reading) {
