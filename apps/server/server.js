@@ -27,6 +27,8 @@ const DB_FILE = path.join(__dirname, 'solarcheck.db');
 const db = new Database(DB_FILE);
 const DASHBOARD_DIST_DIR = path.resolve(__dirname, '../dashboard/dist');
 const DASHBOARD_INDEX_FILE = path.join(DASHBOARD_DIST_DIR, 'index.html');
+const DASHBOARD_DIST_EXISTS = fs.existsSync(DASHBOARD_DIST_DIR);
+const DASHBOARD_INDEX_EXISTS = fs.existsSync(DASHBOARD_INDEX_FILE);
 
 const state = {
 	startedAtMs: Date.now(),
@@ -102,16 +104,16 @@ app.get('/health', (_req, res) => {
 	res.redirect(307, '/api/health');
 });
 
-// TODO: Enable this once the dashboard build output exists.
-// app.use(express.static(DASHBOARD_DIST_DIR));
+if (DASHBOARD_DIST_EXISTS) {
+	app.use(express.static(DASHBOARD_DIST_DIR));
+}
 
 app.use((req, res, next) => {
 	if (req.path.startsWith('/api')) {
 		return next();
 	}
 
-	// TODO: Serve SPA shell from dashboard build when available.
-	if (fs.existsSync(DASHBOARD_INDEX_FILE)) {
+	if (DASHBOARD_INDEX_EXISTS) {
 		return res.sendFile(DASHBOARD_INDEX_FILE);
 	}
 
@@ -131,6 +133,9 @@ app.use((err, _req, res, _next) => {
 app.listen(PORT, () => {
 	console.log(`Solar monitor listening on http://localhost:${PORT}`);
 	console.log(`Polling ${INVERTER_BASE_URL} every ${POLL_SECONDS}s`);
+	if (!DASHBOARD_DIST_EXISTS || !DASHBOARD_INDEX_EXISTS) {
+		console.warn(`Dashboard build not found at ${DASHBOARD_DIST_DIR}; SPA serving is disabled until it exists.`);
+	}
 	startPolling();
 });
 

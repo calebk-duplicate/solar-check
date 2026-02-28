@@ -1,4 +1,4 @@
-import { SystemStatus } from '../types'
+import type { SystemStatus } from '../types'
 
 interface StatusBadgeProps {
   status: SystemStatus

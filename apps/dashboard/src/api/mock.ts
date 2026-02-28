@@ -1,4 +1,4 @@
-import { LiveResponse, HistoryResponse, DailyResponse } from '../types'
+import type { LiveResponse, HistoryResponse, DailyResponse } from '../types'
 
 export const MOCK_LIVE_EXPORTING: LiveResponse = {
   ts_utc: '2026-03-01T01:30:00Z',

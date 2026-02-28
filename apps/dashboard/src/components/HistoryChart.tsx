@@ -1,5 +1,5 @@
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, ResponsiveContainer } from 'recharts'
-import { HistoryPoint } from '../types'
+import type { HistoryPoint } from '../types'
 import { formatTime } from '../utils/format'
 
 interface HistoryChartProps {

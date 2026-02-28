@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { getLive, getHistory, getDaily, USE_MOCK } from '../api/client'
-import { LiveResponse, HistoryResponse, DailyResponse } from '../types'
+import type { LiveResponse, HistoryResponse, DailyResponse } from '../types'
 import { MetricCard } from '../components/MetricCard'
 import { StatusBadge } from '../components/StatusBadge'
 import { HistoryChart } from '../components/HistoryChart'
@@ -13,6 +13,11 @@ export function Dashboard() {
   const [dailyData, setDailyData] = useState<DailyResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [lastLiveSuccessAt, setLastLiveSuccessAt] = useState<number | null>(null)
+  const [lastLiveError, setLastLiveError] = useState<string | null>(null)
+  const [nowMs, setNowMs] = useState(Date.now())
+
+  const isConnected = lastLiveSuccessAt !== null && nowMs - lastLiveSuccessAt <= 10000
 
   useEffect(() => {
     async function fetchInitialData() {
@@ -29,10 +34,14 @@ export function Dashboard() {
 
         setLiveData(live)
         setHistoryData(history)
-        setDailyData(Array.isArray(daily) ? daily[0] : daily)
+        setDailyData(daily)
+        setLastLiveSuccessAt(Date.now())
+        setLastLiveError(null)
         setError(null)
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to load data')
+        const message = err instanceof Error ? err.message : 'Failed to load data'
+        setError(message)
+        setLastLiveError(message)
       } finally {
         setIsLoading(false)
       }
@@ -46,13 +55,25 @@ export function Dashboard() {
       try {
         const live = await getLive()
         setLiveData(live)
+        setLastLiveSuccessAt(Date.now())
+        setLastLiveError(null)
         setError(null)
       } catch (err) {
-        setError(err instanceof Error ? err.message : 'Failed to fetch live data')
+        const message = err instanceof Error ? err.message : 'Failed to fetch live data'
+        setError(message)
+        setLastLiveError(message)
       }
     }, 5000)
 
     return () => clearInterval(interval)
+  }, [])
+
+  useEffect(() => {
+    const heartbeat = setInterval(() => {
+      setNowMs(Date.now())
+    }, 1000)
+
+    return () => clearInterval(heartbeat)
   }, [])
 
   if (isLoading) {
@@ -69,6 +90,12 @@ export function Dashboard() {
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4 md:p-6 lg:p-8">
       <div className="max-w-7xl mx-auto">
+        <div className={`mb-6 p-3 rounded-lg border ${isConnected ? 'bg-green-900/50 border-green-700' : 'bg-red-900/50 border-red-700'}`}>
+          <p className={`text-sm font-medium ${isConnected ? 'text-green-200' : 'text-red-200'}`}>
+            {isConnected ? 'Connected' : `Disconnected${lastLiveError ? `: ${lastLiveError}` : ''}`}
+          </p>
+        </div>
+
         <header className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
           <div>
             <h1 className="text-3xl md:text-4xl font-bold">Solar Dashboard</h1>
@@ -159,15 +186,15 @@ export function Dashboard() {
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Import Cost</p>
-                  <p className="text-lg font-semibold text-red-400">{formatCurrency(dailyData.import_cost)}</p>
+                  <p className="text-lg font-semibold text-red-400">{formatCurrency(dailyData.import_cost ?? 0)}</p>
                 </div>
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Export Credit</p>
-                  <p className="text-lg font-semibold text-green-400">{formatCurrency(dailyData.export_credit)}</p>
+                  <p className="text-lg font-semibold text-green-400">{formatCurrency(dailyData.export_credit ?? 0)}</p>
                 </div>
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Net Cost</p>
-                  <p className="text-lg font-semibold text-white">{formatCurrency(dailyData.net_cost)}</p>
+                  <p className="text-lg font-semibold text-white">{formatCurrency(dailyData.net_cost ?? 0)}</p>
                 </div>
               </div>
             </div>

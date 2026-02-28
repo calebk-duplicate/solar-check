@@ -28,9 +28,9 @@ export interface DailyResponse {
   import_kwh: number
   export_kwh: number
   self_kwh: number
-  import_cost: number
-  export_credit: number
-  net_cost: number
+  import_cost?: number
+  export_credit?: number
+  net_cost?: number
 }
 
 export type SystemStatus = 'exporting' | 'importing' | 'neutral'

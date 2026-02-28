@@ -1,4 +1,4 @@
-import { LiveResponse, SystemStatus } from '../types'
+import type { LiveResponse, SystemStatus } from '../types'
 import { format } from 'date-fns'
 
 export function determineStatus(data: LiveResponse): SystemStatus {
