@@ -1,0 +1,179 @@
+import { useState, useEffect } from 'react'
+import { getLive, getHistory, getDaily, USE_MOCK } from '../api/client'
+import { LiveResponse, HistoryResponse, DailyResponse } from '../types'
+import { MetricCard } from '../components/MetricCard'
+import { StatusBadge } from '../components/StatusBadge'
+import { HistoryChart } from '../components/HistoryChart'
+import { determineStatus, formatWatts, formatTimestamp, formatKWh, formatCurrency } from '../utils/format'
+import { subHours } from 'date-fns'
+
+export function Dashboard() {
+  const [liveData, setLiveData] = useState<LiveResponse | null>(null)
+  const [historyData, setHistoryData] = useState<HistoryResponse | null>(null)
+  const [dailyData, setDailyData] = useState<DailyResponse | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [isLoading, setIsLoading] = useState(true)
+
+  useEffect(() => {
+    async function fetchInitialData() {
+      try {
+        setIsLoading(true)
+        const now = new Date()
+        const yesterday = subHours(now, 24)
+
+        const [live, history, daily] = await Promise.all([
+          getLive(),
+          getHistory(yesterday.toISOString(), now.toISOString()),
+          getDaily(now.toISOString().split('T')[0], now.toISOString().split('T')[0]),
+        ])
+
+        setLiveData(live)
+        setHistoryData(history)
+        setDailyData(Array.isArray(daily) ? daily[0] : daily)
+        setError(null)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to load data')
+      } finally {
+        setIsLoading(false)
+      }
+    }
+
+    fetchInitialData()
+  }, [])
+
+  useEffect(() => {
+    const interval = setInterval(async () => {
+      try {
+        const live = await getLive()
+        setLiveData(live)
+        setError(null)
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to fetch live data')
+      }
+    }, 5000)
+
+    return () => clearInterval(interval)
+  }, [])
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-gray-900 text-white flex items-center justify-center">
+        <div className="text-center">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-white mx-auto mb-4"></div>
+          <p className="text-gray-400">Loading dashboard...</p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="min-h-screen bg-gray-900 text-white p-4 md:p-6 lg:p-8">
+      <div className="max-w-7xl mx-auto">
+        <header className="mb-8 flex flex-col md:flex-row md:items-center md:justify-between gap-4">
+          <div>
+            <h1 className="text-3xl md:text-4xl font-bold">Solar Dashboard</h1>
+            <p className="text-gray-400 mt-1">
+              Real-time energy monitoring {USE_MOCK && '(Mock Mode)'}
+            </p>
+          </div>
+
+          <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3">
+            {liveData && <StatusBadge status={determineStatus(liveData)} />}
+            {liveData && (
+              <p className="text-sm text-gray-400">
+                Updated: {formatTimestamp(liveData.ts_utc)}
+              </p>
+            )}
+          </div>
+        </header>
+
+        {error && (
+          <div className="mb-6 p-4 bg-red-900/50 border border-red-700 rounded-lg">
+            <p className="text-red-200">⚠️ {error}</p>
+          </div>
+        )}
+
+        {liveData && (
+          <>
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 md:gap-6 mb-8">
+              <MetricCard
+                label="PV Generation"
+                value={formatWatts(liveData.pv_w)}
+                unit="W"
+              />
+              <MetricCard
+                label="Load"
+                value={formatWatts(liveData.load_w)}
+                unit="W"
+              />
+              <MetricCard
+                label="Grid Import"
+                value={formatWatts(liveData.grid_import_w)}
+                unit="W"
+              />
+              <MetricCard
+                label="Grid Export"
+                value={formatWatts(liveData.grid_export_w)}
+                unit="W"
+              />
+            </div>
+
+            {liveData.explanation && (
+              <div className="mb-8 p-4 bg-gray-800 border border-gray-700 rounded-lg">
+                <p className="text-gray-300">ℹ️ {liveData.explanation}</p>
+              </div>
+            )}
+          </>
+        )}
+
+        {historyData && historyData.data.length > 0 && (
+          <div className="mb-8">
+            <HistoryChart data={historyData.data} />
+          </div>
+        )}
+
+        {dailyData && (
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+            <h3 className="text-lg font-semibold mb-4">Today's Summary</h3>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 md:gap-6">
+              <div>
+                <p className="text-sm text-gray-400 mb-1">PV Generated</p>
+                <p className="text-2xl font-bold text-yellow-400">{formatKWh(dailyData.pv_kwh)} kWh</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400 mb-1">Load Consumed</p>
+                <p className="text-2xl font-bold text-blue-400">{formatKWh(dailyData.load_kwh)} kWh</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400 mb-1">Grid Import</p>
+                <p className="text-2xl font-bold text-amber-500">{formatKWh(dailyData.import_kwh)} kWh</p>
+              </div>
+              <div>
+                <p className="text-sm text-gray-400 mb-1">Grid Export</p>
+                <p className="text-2xl font-bold text-green-500">{formatKWh(dailyData.export_kwh)} kWh</p>
+              </div>
+            </div>
+
+            <div className="mt-6 pt-6 border-t border-gray-700">
+              <h4 className="text-sm font-semibold text-gray-300 mb-3">Cost Summary</h4>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Import Cost</p>
+                  <p className="text-lg font-semibold text-red-400">{formatCurrency(dailyData.import_cost)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Export Credit</p>
+                  <p className="text-lg font-semibold text-green-400">{formatCurrency(dailyData.export_credit)}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-500 mb-1">Net Cost</p>
+                  <p className="text-lg font-semibold text-white">{formatCurrency(dailyData.net_cost)}</p>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
