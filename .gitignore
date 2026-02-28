@@ -1,0 +1,5 @@
+node_modules/
+apps/server/.env
+apps/server/solarcheck.db
+apps/server/solarcheck.db-shm
+apps/server/solarcheck.db-wal

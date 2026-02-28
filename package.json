@@ -1,0 +1,11 @@
+{
+  "name": "solarcheck",
+  "private": true,
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "start": "npm --workspace apps/server run start",
+    "dev": "npm --workspace apps/server run start"
+  }
+}
