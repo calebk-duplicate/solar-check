@@ -37,6 +37,8 @@ const state = {
 	lastError: null,
 	lastReadingTsUtc: null,
 	pollingInProgress: false,
+	consecutiveZeroLoadWithPv: 0,
+	liveDataWarning: null,
 };
 
 initializeDatabase(db);
@@ -63,11 +65,15 @@ api.get('/live', (_req, res) => {
 	if (!row) {
 		return res.json({
 			data: null,
+			data_warning: null,
 			message: 'No readings yet',
 		});
 	}
 
-	return res.json({ data: withDerivedValues(row) });
+	return res.json({
+		data: withDerivedValues(row),
+		data_warning: state.liveDataWarning,
+	});
 });
 
 api.get('/history', (req, res) => {
@@ -280,6 +286,14 @@ async function pollOnce() {
 		state.lastError = null;
 		state.lastReadingTsUtc = reading.ts_utc;
 
+		if (reading.pv_w > 0 && reading.load_w === 0) {
+			state.consecutiveZeroLoadWithPv += 1;
+		} else {
+			state.consecutiveZeroLoadWithPv = 0;
+		}
+
+		state.liveDataWarning = getDataWarning(reading, state.consecutiveZeroLoadWithPv);
+
 		if (insertResult.changes > 0) {
 			console.log(`[db] inserted reading ${reading.ts_utc}`);
 			recomputeDailyAggForRange(db, statements, reading.ts_utc, reading.ts_utc);
@@ -361,6 +375,22 @@ function parseFroniusPayload(payload) {
 function safeNumber(value, fallback = 0) {
 	const parsed = Number(value);
 	return Number.isFinite(parsed) ? parsed : fallback;
+}
+
+function getDataWarning(reading, consecutiveZeroLoadWithPv) {
+	if (consecutiveZeroLoadWithPv > 5) {
+		return 'pv_w > 0 and load_w === 0 for more than 5 consecutive polls';
+	}
+
+	if (reading.load_w > reading.pv_w && reading.grid_export_w > 0) {
+		return 'load_w > pv_w and grid_export_w > 0';
+	}
+
+	if (reading.grid_import_w > 0 && reading.grid_export_w > 0) {
+		return 'grid_import_w > 0 and grid_export_w > 0';
+	}
+
+	return null;
 }
 
 function recomputeDailyAggForRange(database, prepared, fromIsoUtc, toIsoUtc) {
