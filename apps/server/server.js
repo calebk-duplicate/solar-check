@@ -255,11 +255,13 @@ function startPolling() {
 
 async function pollOnce() {
 	if (state.pollingInProgress) {
+		console.log('[poll] skipped: previous poll still in progress');
 		return;
 	}
 
 	state.pollingInProgress = true;
 	state.lastPollAtUtc = new Date().toISOString();
+	console.log(`[poll] start ${state.lastPollAtUtc}`);
 
 	try {
 		const reading = await fetchPowerFlowReading(INVERTER_BASE_URL);
@@ -270,13 +272,19 @@ async function pollOnce() {
 			reading.grid_import_w,
 			reading.grid_export_w,
 		);
+		console.log(
+			`[poll] parsed ts=${reading.ts_utc} pv=${reading.pv_w}W load=${reading.load_w}W import=${reading.grid_import_w}W export=${reading.grid_export_w}W`,
+		);
 
 		state.lastSuccessAtUtc = new Date().toISOString();
 		state.lastError = null;
 		state.lastReadingTsUtc = reading.ts_utc;
 
 		if (insertResult.changes > 0) {
+			console.log(`[db] inserted reading ${reading.ts_utc}`);
 			recomputeDailyAggForRange(db, statements, reading.ts_utc, reading.ts_utc);
+		} else {
+			console.log(`[db] skipped duplicate reading ${reading.ts_utc}`);
 		}
 	} catch (error) {
 		state.lastError = error?.message || String(error);
@@ -292,6 +300,7 @@ async function fetchPowerFlowReading(baseUrl) {
 
 	try {
 		const url = `${baseUrl}/solar_api/v1/GetPowerFlowRealtimeData.fcgi`;
+		console.log(`[poll] fetch ${url}`);
 		const response = await fetch(url, {
 			method: 'GET',
 			signal: controller.signal,
@@ -303,6 +312,7 @@ async function fetchPowerFlowReading(baseUrl) {
 		}
 
 		const payload = await response.json();
+		console.log(JSON.stringify(payload.Body.Data, null, 2));
 		return parseFroniusPayload(payload);
 	} finally {
 		clearTimeout(timeout);
@@ -316,28 +326,28 @@ function parseFroniusPayload(payload) {
 	const site = data?.Site || {};
 
 	const inverterMap = data?.Inverters || {};
+	const inverter1Pv = inverterMap?.['1']?.P;
 	const inverterPvSum = Object.values(inverterMap).reduce((sum, item) => {
 		return sum + safeNumber(item?.P, 0);
 	}, 0);
 
-	const pvRaw = safeNumber(site.P_PV, inverterPvSum);
-	const loadRaw = safeNumber(site.P_Load, 0);
-	const gridSigned = safeNumber(site.P_Grid, 0);
+	const pvSource = [site.P_PV, inverter1Pv, data?.P_PV, inverterPvSum].find((value) => Number.isFinite(Number(value)));
+	const loadSource = [site.P_Load, data?.P_Load].find((value) => Number.isFinite(Number(value)));
+	const gridSource = [site.P_Grid].find((value) => Number.isFinite(Number(value)));
 
 	const tsSource = head?.Timestamp || new Date().toISOString();
 	const tsUtc = new Date(tsSource).toISOString();
 
-	const pvW = Math.max(0, Math.round(pvRaw));
-	const loadW = Math.max(0, Math.round(loadRaw));
+	const pvW = Math.max(0, Math.round(safeNumber(pvSource, 0)));
+	// Some Fronius payloads report load as negative by convention; use absolute watts for household consumption.
+	const loadW = Math.max(0, Math.round(Math.abs(safeNumber(loadSource, 0))));
 
-	let gridImportW = 0;
-	let gridExportW = 0;
+	const gridNetW = gridSource !== undefined
+		? Math.round(safeNumber(gridSource, 0))
+		: Math.round(loadW - pvW);
 
-	if (gridSigned >= 0) {
-		gridImportW = Math.round(gridSigned);
-	} else {
-		gridExportW = Math.round(Math.abs(gridSigned));
-	}
+	const gridImportW = Math.max(0, gridNetW);
+	const gridExportW = Math.max(0, -gridNetW);
 
 	return {
 		ts_utc: tsUtc,
