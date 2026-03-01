@@ -19,6 +19,8 @@ const DEFAULT_EXPORT_PERIODS = [
 const INVERTER_BASE_URL = (process.env.INVERTER_BASE_URL || '').replace(/\/$/, '');
 const POLL_SECONDS = Number.parseInt(process.env.POLL_SECONDS || '15', 10);
 const PORT = Number.parseInt(process.env.PORT || '8080', 10);
+const ARCHIVE_BACKFILL_MINUTES = Number.parseInt(process.env.ARCHIVE_BACKFILL_MINUTES || '30', 10);
+const ARCHIVE_LOOKBACK_DAYS = Number.parseInt(process.env.ARCHIVE_LOOKBACK_DAYS || '2', 10);
 
 if (!INVERTER_BASE_URL) {
 	throw new Error('Missing required environment variable: INVERTER_BASE_URL');
@@ -30,6 +32,14 @@ if (!Number.isFinite(POLL_SECONDS) || POLL_SECONDS <= 0) {
 
 if (!Number.isFinite(PORT) || PORT <= 0) {
 	throw new Error('PORT must be a positive integer');
+}
+
+if (!Number.isFinite(ARCHIVE_BACKFILL_MINUTES) || ARCHIVE_BACKFILL_MINUTES <= 0) {
+	throw new Error('ARCHIVE_BACKFILL_MINUTES must be a positive integer');
+}
+
+if (!Number.isFinite(ARCHIVE_LOOKBACK_DAYS) || ARCHIVE_LOOKBACK_DAYS <= 0) {
+	throw new Error('ARCHIVE_LOOKBACK_DAYS must be a positive integer');
 }
 
 const app = express();
@@ -48,7 +58,10 @@ const state = {
 	lastSuccessAtUtc: null,
 	lastError: null,
 	lastReadingTsUtc: null,
+	lastArchiveBackfillAtUtc: null,
+	lastArchiveBackfillError: null,
 	pollingInProgress: false,
+	archiveBackfillInProgress: false,
 	consecutiveZeroLoadWithPv: 0,
 	liveDataWarning: null,
 };
@@ -70,6 +83,8 @@ api.get('/health', (_req, res) => {
 		last_success_at_utc: state.lastSuccessAtUtc,
 		last_reading_ts_utc: state.lastReadingTsUtc,
 		last_error: state.lastError,
+		last_archive_backfill_at_utc: state.lastArchiveBackfillAtUtc,
+		last_archive_backfill_error: state.lastArchiveBackfillError,
 	});
 });
 
@@ -229,6 +244,7 @@ app.listen(PORT, '0.0.0.0', () => {
 		console.warn(`Dashboard build not found at ${DASHBOARD_DIST_DIR}; SPA serving is disabled until it exists.`);
 	}
 	startPolling();
+	startArchiveBackfill();
 });
 
 function initializeDatabase(database) {
@@ -798,6 +814,87 @@ function startPolling() {
 	setInterval(() => {
 		pollOnce();
 	}, POLL_SECONDS * 1000);
+}
+
+function startArchiveBackfill() {
+	backfillArchiveOnce();
+	setInterval(() => {
+		backfillArchiveOnce();
+	}, ARCHIVE_BACKFILL_MINUTES * 60 * 1000);
+}
+
+async function backfillArchiveOnce() {
+	if (state.archiveBackfillInProgress) {
+		console.log('[archive] skipped: previous backfill still in progress');
+		return;
+	}
+
+	state.archiveBackfillInProgress = true;
+	state.lastArchiveBackfillAtUtc = new Date().toISOString();
+
+	try {
+		const rates = getRatesSettings(statements);
+		const timezone = rates.timezone;
+		const nowLocal = DateTime.now().setZone(timezone);
+		if (!nowLocal.isValid) {
+			throw new Error(`Invalid timezone for archive backfill: ${timezone}`);
+		}
+
+		const localStart = nowLocal.minus({ days: ARCHIVE_LOOKBACK_DAYS - 1 }).startOf('day');
+		const localEnd = nowLocal.endOf('day');
+
+		const startLocalIso = localStart.toISO();
+		const endLocalIso = localEnd.toISO();
+		if (!startLocalIso || !endLocalIso) {
+			throw new Error('Failed to compute archive backfill range');
+		}
+
+		const buckets = await fetchArchiveEnergyBuckets(INVERTER_BASE_URL, startLocalIso, endLocalIso);
+		const secondsPerDay = 24 * 60 * 60;
+		let upsertedCount = 0;
+
+		for (const bucket of buckets) {
+			const totalOffsetSeconds = Number.parseInt(String(bucket.offset_seconds), 10);
+			if (!Number.isInteger(totalOffsetSeconds) || totalOffsetSeconds < 0) {
+				continue;
+			}
+
+			const dayOffset = Math.floor(totalOffsetSeconds / secondsPerDay);
+			const secondsIntoDay = totalOffsetSeconds % secondsPerDay;
+			const bucketDayStartLocal = localStart.plus({ days: dayOffset }).startOf('day');
+			const bucketLocal = bucketDayStartLocal.plus({ seconds: secondsIntoDay });
+			if (!bucketLocal.isValid) {
+				continue;
+			}
+
+			const tsUtc = bucketLocal.toUTC().toISO();
+			if (!tsUtc) {
+				continue;
+			}
+
+			const result = statements.upsertEnergy5m.run({
+				ts_utc: tsUtc,
+				import_wh: bucket.import_wh,
+				export_wh: bucket.export_wh,
+			});
+
+			if (result.changes > 0) {
+				upsertedCount += 1;
+			}
+		}
+
+		state.lastArchiveBackfillError = null;
+		state.lastArchiveBackfillAtUtc = new Date().toISOString();
+		console.log(
+			`[archive] upserted ${upsertedCount} buckets for ${startLocalIso} -> ${endLocalIso} (${timezone})`,
+		);
+	} catch (error) {
+		state.lastArchiveBackfillError = error?.message || String(error);
+		state.lastArchiveBackfillAtUtc = new Date().toISOString();
+		console.error('Archive backfill failed:', error);
+	} finally {
+		state.archiveBackfillInProgress = false;
+	}
 }
 
 async function pollOnce() {
