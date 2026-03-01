@@ -202,6 +202,70 @@ api.get('/history', (req, res) => {
 	});
 });
 
+api.get('/energy5m', (req, res) => {
+	const range = parseRange(req.query.from, req.query.to, 24 * 7);
+	const rows = statements.getEnergy5mInRange.all(range.from, range.to);
+
+	res.json({
+		from: range.from,
+		to: range.to,
+		count: rows.length,
+		data: rows.map((row) => ({
+			ts_utc: row.ts_utc,
+			import_kwh: Math.round(((Number(row.import_wh) || 0) / 1000) * 10000) / 10000,
+			export_kwh: Math.round(((Number(row.export_wh) || 0) / 1000) * 10000) / 10000,
+		})),
+	});
+});
+
+api.get('/energy-hourly', (req, res) => {
+	const range = parseRange(req.query.from, req.query.to, 24 * 7);
+	const rows = statements.getEnergy5mInRange.all(range.from, range.to);
+	const rates = getRatesSettings(statements);
+	const timezone = rates.timezone;
+	const hourly = new Map();
+
+	for (const row of rows) {
+		const utc = DateTime.fromISO(row.ts_utc, { zone: 'utc' });
+		if (!utc.isValid) {
+			continue;
+		}
+
+		const localHour = utc.setZone(timezone).startOf('hour');
+		if (!localHour.isValid) {
+			continue;
+		}
+
+		const key = localHour.toISO({ suppressMilliseconds: true });
+		if (!key) {
+			continue;
+		}
+
+		if (!hourly.has(key)) {
+			hourly.set(key, {
+				ts_local: key,
+				ts_utc: localHour.toUTC().toISO({ suppressMilliseconds: true }),
+				import_kwh: 0,
+				export_kwh: 0,
+			});
+		}
+
+		const bucket = hourly.get(key);
+		bucket.import_kwh += (Number(row.import_wh) || 0) / 1000;
+		bucket.export_kwh += (Number(row.export_wh) || 0) / 1000;
+	}
+
+	const data = Array.from(hourly.values())
+		.sort((a, b) => a.ts_local.localeCompare(b.ts_local))
+		.map((item) => ({
+			...item,
+			import_kwh: Math.round(item.import_kwh * 10000) / 10000,
+			export_kwh: Math.round(item.export_kwh * 10000) / 10000,
+		}));
+
+	res.json(data);
+});
+
 api.get('/daily', (req, res) => {
 	const range = parseRange(req.query.from, req.query.to, 24 * 7);
 	const readings = statements.getHistoryInRange.all(range.from, range.to);
