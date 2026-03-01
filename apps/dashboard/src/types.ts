@@ -34,3 +34,17 @@ export interface DailyResponse {
 }
 
 export type SystemStatus = 'exporting' | 'importing' | 'neutral'
+
+export interface RatePeriod {
+  days?: 'all' | 'weekday' | 'weekend'
+  start: string
+  end: string
+  cents_per_kwh: number
+}
+
+export interface RatesResponse {
+  daily_fixed_cents: number
+  timezone: string
+  import_periods: RatePeriod[]
+  export_periods: RatePeriod[]
+}

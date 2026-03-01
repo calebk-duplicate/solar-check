@@ -1,4 +1,4 @@
-import type { LiveResponse, HistoryResponse, DailyResponse } from '../types'
+import type { LiveResponse, HistoryResponse, DailyResponse, RatesResponse } from '../types'
 import { getMockLive, getMockHistory, getMockDaily } from './mock'
 
 export const USE_MOCK = false
@@ -83,4 +83,30 @@ export async function getDaily(
   }
 
   return payload
+}
+
+export async function getRates(): Promise<RatesResponse> {
+  const response = await fetch('/api/rates')
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+  }
+  return (await response.json()) as RatesResponse
+}
+
+export async function putRates(rates: RatesResponse): Promise<RatesResponse> {
+  const response = await fetch('/api/rates', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(rates),
+  })
+  if (!response.ok) {
+    let msg = `HTTP ${response.status}: ${response.statusText}`
+    try {
+      const body = (await response.json()) as { error?: string; message?: string }
+      if (body.error) msg = body.error
+      else if (body.message) msg = body.message
+    } catch { /* ignore */ }
+    throw new Error(msg)
+  }
+  return (await response.json()) as RatesResponse
 }

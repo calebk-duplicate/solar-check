@@ -1,16 +1,59 @@
 import { useState, useEffect } from 'react'
-import { getLive, getHistory, getDaily, USE_MOCK } from '../api/client'
-import type { LiveResponse, HistoryResponse, DailyResponse } from '../types'
+import { getLive, getHistory, getDaily, getRates, USE_MOCK } from '../api/client'
+import type { LiveResponse, HistoryResponse, DailyResponse, RatesResponse, RatePeriod } from '../types'
 import { MetricCard } from '../components/MetricCard'
 import { StatusBadge } from '../components/StatusBadge'
 import { HistoryChart } from '../components/HistoryChart'
+import { RatesEditor } from '../components/RatesEditor'
 import { determineStatus, formatWatts, formatTimestamp, formatKWh, formatCurrency } from '../utils/format'
 import { subHours } from 'date-fns'
+
+// Returns current HH:mm and whether it's a weekend in the given IANA timezone.
+function getCurrentTimeInTz(timezone: string): { hhmm: string; isWeekend: boolean } {
+  const now = new Date()
+  const parts = new Intl.DateTimeFormat('en', {
+    timeZone: timezone,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    weekday: 'short',
+  }).formatToParts(now)
+  const hour = parts.find(p => p.type === 'hour')?.value ?? '00'
+  const minute = parts.find(p => p.type === 'minute')?.value ?? '00'
+  const weekday = parts.find(p => p.type === 'weekday')?.value ?? 'Mon'
+  return {
+    hhmm: `${hour}:${minute}`,
+    isWeekend: weekday === 'Sat' || weekday === 'Sun',
+  }
+}
+
+function toMinutes(hhmm: string): number {
+  const [h, m] = hhmm.split(':').map(Number)
+  return h * 60 + m
+}
+
+function isInPeriod(hhmm: string, isWeekend: boolean, period: RatePeriod): boolean {
+  const days = period.days ?? 'all'
+  if (days === 'weekday' && isWeekend) return false
+  if (days === 'weekend' && !isWeekend) return false
+  const cur = toMinutes(hhmm)
+  return cur >= toMinutes(period.start) && cur < toMinutes(period.end)
+}
+
+function hasFreeImportNow(rates: RatesResponse): boolean {
+  try {
+    const { hhmm, isWeekend } = getCurrentTimeInTz(rates.timezone)
+    return rates.import_periods.some(p => p.cents_per_kwh === 0 && isInPeriod(hhmm, isWeekend, p))
+  } catch {
+    return false
+  }
+}
 
 export function Dashboard() {
   const [liveData, setLiveData] = useState<LiveResponse | null>(null)
   const [historyData, setHistoryData] = useState<HistoryResponse | null>(null)
   const [dailyData, setDailyData] = useState<DailyResponse | null>(null)
+  const [rates, setRates] = useState<RatesResponse | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [lastLiveSuccessAt, setLastLiveSuccessAt] = useState<number | null>(null)
@@ -26,15 +69,17 @@ export function Dashboard() {
         const now = new Date()
         const yesterday = subHours(now, 24)
 
-        const [live, history, daily] = await Promise.all([
+        const [live, history, daily, ratesData] = await Promise.all([
           getLive(),
           getHistory(yesterday.toISOString(), now.toISOString()),
           getDaily(now.toISOString().split('T')[0], now.toISOString().split('T')[0]),
+          getRates(),
         ])
 
         setLiveData(live)
         setHistoryData(history)
         setDailyData(daily)
+        setRates(ratesData)
         setLastLiveSuccessAt(Date.now())
         setLastLiveError(null)
         setError(null)
@@ -86,6 +131,8 @@ export function Dashboard() {
       </div>
     )
   }
+
+  const freeImport = rates ? hasFreeImportNow(rates) : false
 
   return (
     <div className="min-h-screen bg-gray-900 text-white p-4 md:p-6 lg:p-8">
@@ -160,7 +207,7 @@ export function Dashboard() {
         )}
 
         {dailyData && (
-          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 mb-8">
             <h3 className="text-lg font-semibold mb-4">Today's Summary</h3>
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 md:gap-6">
               <div>
@@ -182,7 +229,17 @@ export function Dashboard() {
             </div>
 
             <div className="mt-6 pt-6 border-t border-gray-700">
-              <h4 className="text-sm font-semibold text-gray-300 mb-3">Cost Summary</h4>
+              <div className="flex flex-wrap items-center gap-3 mb-3">
+                <h4 className="text-sm font-semibold text-gray-300">Cost Summary</h4>
+                {rates && (
+                  <span className="text-xs text-gray-500">({rates.timezone})</span>
+                )}
+                {freeImport && (
+                  <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-900/60 border border-green-700 text-green-300">
+                    Free import window active
+                  </span>
+                )}
+              </div>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
                   <p className="text-xs text-gray-500 mb-1">Import Cost</p>
@@ -199,6 +256,13 @@ export function Dashboard() {
               </div>
             </div>
           </div>
+        )}
+
+        {rates && (
+          <RatesEditor
+            initialRates={rates}
+            onSaved={updated => setRates(updated)}
+          />
         )}
       </div>
     </div>
