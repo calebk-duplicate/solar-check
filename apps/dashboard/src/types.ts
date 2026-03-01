@@ -35,6 +35,33 @@ export interface DailyResponse {
 
 export type SystemStatus = 'exporting' | 'importing' | 'neutral'
 
+export interface BillDayRow {
+  day_local: string
+  import_kwh: number
+  export_kwh: number
+  import_cost: number
+  export_credit: number
+  fixed_charge: number
+  net_cost: number
+}
+
+export interface BillSummary {
+  from_utc: string
+  to_utc: string
+  days: number
+  total_import_kwh: number
+  total_export_kwh: number
+  total_import_cost: number
+  total_export_credit: number
+  total_fixed_charge: number
+  total_net_cost: number
+}
+
+export interface BillResponse {
+  summary: BillSummary
+  days: BillDayRow[]
+}
+
 export interface RatePeriod {
   days?: 'all' | 'weekday' | 'weekend'
   start: string

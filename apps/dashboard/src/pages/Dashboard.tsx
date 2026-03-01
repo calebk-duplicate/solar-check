@@ -5,6 +5,7 @@ import { MetricCard } from '../components/MetricCard'
 import { StatusBadge } from '../components/StatusBadge'
 import { HistoryChart } from '../components/HistoryChart'
 import { RatesEditor } from '../components/RatesEditor'
+import { BillEstimate } from '../components/BillEstimate'
 import { determineStatus, formatWatts, formatTimestamp, formatKWh, formatCurrency } from '../utils/format'
 import { subHours } from 'date-fns'
 
@@ -257,6 +258,8 @@ export function Dashboard() {
             </div>
           </div>
         )}
+
+        <BillEstimate freeImport={freeImport} />
 
         {rates && (
           <RatesEditor
