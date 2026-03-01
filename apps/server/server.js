@@ -222,8 +222,8 @@ app.use((err, _req, res, _next) => {
 	});
 });
 
-app.listen(PORT, () => {
-	console.log(`Solar monitor listening on http://localhost:${PORT}`);
+app.listen(PORT, '0.0.0.0', () => {
+	console.log(`Solar monitor listening on http://0.0.0.0:${PORT}`);
 	console.log(`Polling ${INVERTER_BASE_URL} every ${POLL_SECONDS}s`);
 	if (!DASHBOARD_DIST_EXISTS || !DASHBOARD_INDEX_EXISTS) {
 		console.warn(`Dashboard build not found at ${DASHBOARD_DIST_DIR}; SPA serving is disabled until it exists.`);
@@ -243,6 +243,14 @@ function initializeDatabase(database) {
 			grid_import_w INTEGER NOT NULL,
 			grid_export_w INTEGER NOT NULL
 		);
+
+		CREATE TABLE IF NOT EXISTS energy_5m (
+			ts_utc TEXT PRIMARY KEY,
+			import_wh REAL NOT NULL,
+			export_wh REAL NOT NULL
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_energy_5m_ts_utc ON energy_5m(ts_utc);
 
 		CREATE TABLE IF NOT EXISTS daily_agg (
 			day TEXT PRIMARY KEY,
@@ -304,6 +312,25 @@ function prepareStatements(database) {
 			FROM readings
 			WHERE ts_utc >= ? AND ts_utc < ?
 			ORDER BY ts_utc ASC
+		`),
+		upsertEnergy5m: database.prepare(`
+			INSERT INTO energy_5m (ts_utc, import_wh, export_wh)
+			VALUES (@ts_utc, @import_wh, @export_wh)
+			ON CONFLICT(ts_utc) DO UPDATE SET
+				import_wh = excluded.import_wh,
+				export_wh = excluded.export_wh
+		`),
+		getEnergy5mInRange: database.prepare(`
+			SELECT ts_utc, import_wh, export_wh
+			FROM energy_5m
+			WHERE ts_utc >= ? AND ts_utc <= ?
+			ORDER BY ts_utc ASC
+		`),
+		getLatestEnergy5mTs: database.prepare(`
+			SELECT ts_utc
+			FROM energy_5m
+			ORDER BY ts_utc DESC
+			LIMIT 1
 		`),
 		getSetting: database.prepare(`
 			SELECT value
