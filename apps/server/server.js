@@ -649,6 +649,94 @@ function aggregateBillFromReadings(rows, rates, fromUtc, toUtc) {
 	};
 }
 
+function aggregateBillFromEnergyBuckets(rows, rates, fromUtc, toUtc) {
+	const timezone = rates.timezone;
+	const dailyMap = new Map();
+
+	for (const dayLocal of enumerateLocalDaysInRange(fromUtc, toUtc, timezone)) {
+		dailyMap.set(dayLocal, {
+			day_local: dayLocal,
+			import_kwh: 0,
+			export_kwh: 0,
+			import_cost: 0,
+			export_credit: 0,
+			fixed_charge: Number(rates.daily_fixed_cents),
+			net_cost: 0,
+		});
+	}
+
+	for (const row of rows || []) {
+		const utc = DateTime.fromISO(row.ts_utc, { zone: 'utc' });
+		if (!utc.isValid) {
+			continue;
+		}
+
+		const local = utc.setZone(timezone);
+		if (!local.isValid) {
+			continue;
+		}
+
+		const dayLocal = local.toFormat('yyyy-LL-dd');
+		if (!dailyMap.has(dayLocal)) {
+			dailyMap.set(dayLocal, {
+				day_local: dayLocal,
+				import_kwh: 0,
+				export_kwh: 0,
+				import_cost: 0,
+				export_credit: 0,
+				fixed_charge: Number(rates.daily_fixed_cents),
+				net_cost: 0,
+			});
+		}
+
+		const dayGroup = dayGroupFromLocalDateTime(local);
+		const hhmm = local.toFormat('HH:mm');
+		const importRate = findRateForTime(rates.import_periods, dayGroup, hhmm);
+		const exportRate = findRateForTime(rates.export_periods, dayGroup, hhmm);
+
+		const importKwh = Math.max(0, Number(row.import_wh) || 0) / 1000;
+		const exportKwh = Math.max(0, Number(row.export_wh) || 0) / 1000;
+
+		const bucket = dailyMap.get(dayLocal);
+		bucket.import_kwh += importKwh;
+		bucket.export_kwh += exportKwh;
+		bucket.import_cost += importKwh * importRate;
+		bucket.export_credit += exportKwh * exportRate;
+	}
+
+	const days = Array.from(dailyMap.values())
+		.sort((a, b) => a.day_local.localeCompare(b.day_local))
+		.map((item) => {
+			const netCost = item.import_cost - item.export_credit + item.fixed_charge;
+			return {
+				day_local: item.day_local,
+				import_kwh: round3(item.import_kwh),
+				export_kwh: round3(item.export_kwh),
+				import_cost: round3(item.import_cost),
+				export_credit: round3(item.export_credit),
+				fixed_charge: round3(item.fixed_charge),
+				net_cost: round3(netCost),
+			};
+		});
+
+	const summary = {
+		from_utc: fromUtc,
+		to_utc: toUtc,
+		days: days.length,
+		total_import_kwh: round3(days.reduce((sum, day) => sum + day.import_kwh, 0)),
+		total_export_kwh: round3(days.reduce((sum, day) => sum + day.export_kwh, 0)),
+		total_import_cost: round3(days.reduce((sum, day) => sum + day.import_cost, 0)),
+		total_export_credit: round3(days.reduce((sum, day) => sum + day.export_credit, 0)),
+		total_fixed_charge: round3(days.reduce((sum, day) => sum + day.fixed_charge, 0)),
+		total_net_cost: round3(days.reduce((sum, day) => sum + day.net_cost, 0)),
+	};
+
+	return {
+		summary,
+		days,
+	};
+}
+
 function enumerateLocalDaysInRange(fromUtc, toUtc, timezone) {
 	const fromLocal = DateTime.fromISO(fromUtc, { zone: 'utc' }).setZone(timezone);
 	const toLocal = DateTime.fromISO(toUtc, { zone: 'utc' }).setZone(timezone);
