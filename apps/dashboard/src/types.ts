@@ -62,6 +62,19 @@ export interface BillResponse {
   days: BillDayRow[]
 }
 
+export interface Energy5mPoint {
+  ts_utc: string
+  import_wh: number
+  export_wh: number
+}
+
+export interface Energy5mResponse {
+  from: string
+  to: string
+  count: number
+  data: Energy5mPoint[]
+}
+
 export interface RatePeriod {
   days?: 'all' | 'weekday' | 'weekend'
   start: string
