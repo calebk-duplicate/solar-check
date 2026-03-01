@@ -25,7 +25,7 @@ function getRangeForPreset(preset: Exclude<RangePreset, 'custom'>): RangeWindow 
 }
 
 function fmtCurrency(n: number): string {
-  return `$${n.toFixed(2)}`
+  return `$${(n / 100).toFixed(2)}`
 }
 
 function fmtKWh(n: number): string {
