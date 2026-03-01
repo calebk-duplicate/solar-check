@@ -183,8 +183,8 @@ api.get('/bill', (req, res) => {
 		const range = parseRange(req.query.from, req.query.to, 24 * 7);
 		const readings = statements.getHistoryInRange.all(range.from, range.to);
 		const rates = getRatesSettings(statements);
-		const daily = aggregateBillFromReadings(readings, rates);
-		res.json(daily);
+		const bill = aggregateBillFromReadings(readings, rates, range.from, range.to);
+		res.json(bill);
 	} catch (error) {
 		res.status(400).json({ error: error?.message || String(error) });
 	}
@@ -493,58 +493,87 @@ function dayGroupFromLocalDateTime(localDateTime) {
 	return localDateTime.weekday === 6 || localDateTime.weekday === 7 ? 'weekend' : 'weekday';
 }
 
-function aggregateBillFromReadings(rows, rates) {
-	if (!rows || rows.length < 2) {
-		return [];
-	}
-
+function aggregateBillFromReadings(rows, rates, fromUtc, toUtc) {
+	const timezone = rates.timezone;
 	const dailyMap = new Map();
 
-	for (let index = 1; index < rows.length; index += 1) {
-		const prev = rows[index - 1];
-		const curr = rows[index];
-
-		const prevTs = Date.parse(prev.ts_utc);
-		const currTs = Date.parse(curr.ts_utc);
-		if (!Number.isFinite(prevTs) || !Number.isFinite(currTs) || currTs <= prevTs) {
-			continue;
-		}
-
-		const hours = (currTs - prevTs) / 3600000;
-		const importKwh = (prev.grid_import_w / 1000) * hours;
-		const exportKwh = (prev.grid_export_w / 1000) * hours;
-
-		const localTime = DateTime.fromISO(prev.ts_utc, { zone: 'utc' }).setZone(rates.timezone);
-		if (!localTime.isValid) {
-			continue;
-		}
-
-		const hhmm = localTime.toFormat('HH:mm');
-		const dayLocal = localTime.toFormat('yyyy-LL-dd');
-		const dayGroup = dayGroupFromLocalDateTime(localTime);
-		const importRate = findRateForTime(rates.import_periods, dayGroup, hhmm);
-		const exportRate = findRateForTime(rates.export_periods, dayGroup, hhmm);
-
-		if (!dailyMap.has(dayLocal)) {
-			dailyMap.set(dayLocal, {
-				day_local: dayLocal,
-				import_kwh: 0,
-				export_kwh: 0,
-				import_cost: 0,
-				export_credit: 0,
-				fixed_charge: rates.daily_fixed_cents,
-				net_cost: 0,
-			});
-		}
-
-		const bucket = dailyMap.get(dayLocal);
-		bucket.import_kwh += importKwh;
-		bucket.export_kwh += exportKwh;
-		bucket.import_cost += importKwh * importRate;
-		bucket.export_credit += exportKwh * exportRate;
+	for (const dayLocal of enumerateLocalDaysInRange(fromUtc, toUtc, timezone)) {
+		dailyMap.set(dayLocal, {
+			day_local: dayLocal,
+			import_kwh: 0,
+			export_kwh: 0,
+			import_cost: 0,
+			export_credit: 0,
+			fixed_charge: Number(rates.daily_fixed_cents),
+			net_cost: 0,
+		});
 	}
 
-	return Array.from(dailyMap.values())
+	const rateBoundaryMinutes = collectRateBoundaryMinutes(rates);
+
+	if (rows && rows.length >= 2) {
+		for (let index = 1; index < rows.length; index += 1) {
+			const prev = rows[index - 1];
+			const curr = rows[index];
+
+			const prevUtc = DateTime.fromISO(prev.ts_utc, { zone: 'utc' });
+			const currUtc = DateTime.fromISO(curr.ts_utc, { zone: 'utc' });
+			if (!prevUtc.isValid || !currUtc.isValid || currUtc <= prevUtc) {
+				continue;
+			}
+
+			const importW = Math.max(0, Number(prev.grid_import_w) || 0);
+			const exportW = Math.max(0, Number(prev.grid_export_w) || 0);
+
+			let cursorUtc = prevUtc;
+			while (cursorUtc < currUtc) {
+				const cursorLocal = cursorUtc.setZone(timezone);
+				if (!cursorLocal.isValid) {
+					break;
+				}
+
+				const nextBoundaryUtc = nextBillBoundaryUtc(cursorLocal, rateBoundaryMinutes);
+				const segmentEndUtc = nextBoundaryUtc < currUtc ? nextBoundaryUtc : currUtc;
+				if (!(segmentEndUtc > cursorUtc)) {
+					break;
+				}
+
+				const dayLocal = cursorLocal.toFormat('yyyy-LL-dd');
+				if (!dailyMap.has(dayLocal)) {
+					dailyMap.set(dayLocal, {
+						day_local: dayLocal,
+						import_kwh: 0,
+						export_kwh: 0,
+						import_cost: 0,
+						export_credit: 0,
+						fixed_charge: Number(rates.daily_fixed_cents),
+						net_cost: 0,
+					});
+				}
+
+				const hours = segmentEndUtc.diff(cursorUtc, 'hours').hours;
+				if (hours > 0) {
+					const dayGroup = dayGroupFromLocalDateTime(cursorLocal);
+					const hhmm = cursorLocal.toFormat('HH:mm');
+					const importRate = findRateForTime(rates.import_periods, dayGroup, hhmm);
+					const exportRate = findRateForTime(rates.export_periods, dayGroup, hhmm);
+
+					const importKwh = (importW / 1000) * hours;
+					const exportKwh = (exportW / 1000) * hours;
+
+					const bucket = dailyMap.get(dayLocal);
+					bucket.import_kwh += importKwh;
+					bucket.export_kwh += exportKwh;
+					bucket.import_cost += importKwh * importRate;
+					bucket.export_credit += exportKwh * exportRate;
+				}
+
+				cursorUtc = segmentEndUtc;
+			}
+		}
+	}
+
+	const days = Array.from(dailyMap.values())
 		.sort((a, b) => a.day_local.localeCompare(b.day_local))
 		.map((item) => {
 			const netCost = item.import_cost - item.export_credit + item.fixed_charge;
@@ -558,6 +587,82 @@ function aggregateBillFromReadings(rows, rates) {
 				net_cost: round3(netCost),
 			};
 		});
+
+	const summary = {
+		from_utc: fromUtc,
+		to_utc: toUtc,
+		days: days.length,
+		total_import_kwh: round3(days.reduce((sum, day) => sum + day.import_kwh, 0)),
+		total_export_kwh: round3(days.reduce((sum, day) => sum + day.export_kwh, 0)),
+		total_import_cost: round3(days.reduce((sum, day) => sum + day.import_cost, 0)),
+		total_export_credit: round3(days.reduce((sum, day) => sum + day.export_credit, 0)),
+		total_fixed_charge: round3(days.reduce((sum, day) => sum + day.fixed_charge, 0)),
+		total_net_cost: round3(days.reduce((sum, day) => sum + day.net_cost, 0)),
+	};
+
+	return {
+		summary,
+		days,
+	};
+}
+
+function enumerateLocalDaysInRange(fromUtc, toUtc, timezone) {
+	const fromLocal = DateTime.fromISO(fromUtc, { zone: 'utc' }).setZone(timezone);
+	const toLocal = DateTime.fromISO(toUtc, { zone: 'utc' }).setZone(timezone);
+	if (!fromLocal.isValid || !toLocal.isValid || toLocal < fromLocal) {
+		return [];
+	}
+
+	const days = [];
+	let cursor = fromLocal.startOf('day');
+	const end = toLocal.startOf('day');
+
+	while (cursor <= end) {
+		days.push(cursor.toFormat('yyyy-LL-dd'));
+		cursor = cursor.plus({ days: 1 });
+	}
+
+	return days;
+}
+
+function collectRateBoundaryMinutes(rates) {
+	const boundaries = new Set();
+	const addBoundary = (hhmm, allow2400) => {
+		const minute = parseTimeToMinutes(hhmm, allow2400);
+		if (minute > 0 && minute < 24 * 60) {
+			boundaries.add(minute);
+		}
+	};
+
+	for (const period of rates.import_periods) {
+		addBoundary(period.start, false);
+		addBoundary(period.end, true);
+	}
+
+	for (const period of rates.export_periods) {
+		addBoundary(period.start, false);
+		addBoundary(period.end, true);
+	}
+
+	return Array.from(boundaries).sort((a, b) => a - b);
+}
+
+function nextBillBoundaryUtc(localDateTime, boundaryMinutes) {
+	const dayStart = localDateTime.startOf('day');
+	const currentMinute = localDateTime.hour * 60 + localDateTime.minute;
+
+	for (const minute of boundaryMinutes) {
+		if (minute <= currentMinute) {
+			continue;
+		}
+
+		const candidateLocal = dayStart.plus({ minutes: minute });
+		if (candidateLocal.isValid) {
+			return candidateLocal.setZone('utc');
+		}
+	}
+
+	return dayStart.plus({ days: 1 }).setZone('utc');
 }
 
 function parseRange(fromRaw, toRaw, fallbackHours) {
