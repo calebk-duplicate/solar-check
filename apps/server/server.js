@@ -874,6 +874,103 @@ async function fetchPowerFlowReading(baseUrl) {
 	}
 }
 
+async function fetchArchiveEnergyBuckets(baseUrl, startLocalIso, endLocalIso) {
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 15000);
+
+	try {
+		const url = new URL(`${baseUrl}/solar_api/v1/GetArchiveData.cgi`);
+		url.searchParams.append('Scope', 'System');
+		url.searchParams.append('SeriesType', 'Detail');
+		url.searchParams.append('HumanReadable', 'True');
+		url.searchParams.append('StartDate', startLocalIso);
+		url.searchParams.append('EndDate', endLocalIso);
+		url.searchParams.append('Channel', 'EnergyReal_WAC_Sum_Consumed');
+		url.searchParams.append('Channel', 'EnergyReal_WAC_Sum_Produced');
+
+		const response = await fetch(url, {
+			method: 'GET',
+			signal: controller.signal,
+			headers: { Accept: 'application/json' },
+		});
+
+		if (!response.ok) {
+			throw new Error(`Fronius archive API error: HTTP ${response.status}`);
+		}
+
+		const payload = await response.json();
+		const statusCode = payload?.Head?.Status?.Code;
+		if (statusCode !== undefined && Number(statusCode) !== 0) {
+			const statusReason = payload?.Head?.Status?.Reason;
+			throw new Error(`Fronius archive API status error: ${statusCode}${statusReason ? ` ${statusReason}` : ''}`);
+		}
+
+		if (!payload?.Body?.Data || typeof payload.Body.Data !== 'object') {
+			throw new Error('Fronius archive payload missing Body.Data');
+		}
+
+		return parseFroniusArchiveDetail(payload);
+	} finally {
+		clearTimeout(timeout);
+	}
+}
+
+function parseFroniusArchiveDetail(payload) {
+	const bodyData = payload?.Body?.Data;
+	if (!bodyData || typeof bodyData !== 'object') {
+		throw new Error('Invalid archive payload: missing Body.Data');
+	}
+
+	const firstNode = Object.values(bodyData).find((node) => node && typeof node === 'object');
+	if (!firstNode || typeof firstNode !== 'object') {
+		throw new Error('Invalid archive payload: no data nodes in Body.Data');
+	}
+
+	const nodeData = firstNode.Data;
+	if (!nodeData || typeof nodeData !== 'object') {
+		throw new Error('Invalid archive payload: node missing Data');
+	}
+
+	const consumedSeries = nodeData.EnergyReal_WAC_Sum_Consumed;
+	const producedSeries = nodeData.EnergyReal_WAC_Sum_Produced;
+	if (!consumedSeries || !producedSeries) {
+		throw new Error('Invalid archive payload: required channels are missing');
+	}
+
+	if (consumedSeries.Unit !== 'Wh') {
+		throw new Error(`Invalid unit for EnergyReal_WAC_Sum_Consumed: ${consumedSeries.Unit}`);
+	}
+
+	if (producedSeries.Unit !== 'Wh') {
+		throw new Error(`Invalid unit for EnergyReal_WAC_Sum_Produced: ${producedSeries.Unit}`);
+	}
+
+	const consumedValues = consumedSeries.Values && typeof consumedSeries.Values === 'object' ? consumedSeries.Values : {};
+	const producedValues = producedSeries.Values && typeof producedSeries.Values === 'object' ? producedSeries.Values : {};
+
+	const offsets = new Set([...Object.keys(consumedValues), ...Object.keys(producedValues)]);
+	const buckets = Array.from(offsets)
+		.map((offsetKey) => {
+			const offsetSeconds = Number.parseInt(offsetKey, 10);
+			if (!Number.isInteger(offsetSeconds) || offsetSeconds < 0) {
+				return null;
+			}
+
+			const importWh = safeNumber(consumedValues[offsetKey], 0);
+			const exportWh = safeNumber(producedValues[offsetKey], 0);
+
+			return {
+				offset_seconds: offsetSeconds,
+				import_wh: importWh,
+				export_wh: exportWh,
+			};
+		})
+		.filter((bucket) => bucket !== null)
+		.sort((a, b) => a.offset_seconds - b.offset_seconds);
+
+	return buckets;
+}
+
 function parseFroniusPayload(payload) {
 	const body = payload?.Body;
 	const head = payload?.Head;
