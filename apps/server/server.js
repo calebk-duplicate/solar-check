@@ -196,12 +196,44 @@ api.get('/daily', (req, res) => {
 api.get('/bill', (req, res) => {
 	try {
 		const range = parseRange(req.query.from, req.query.to, 24 * 7);
-		const readings = statements.getHistoryInRange.all(range.from, range.to);
 		const rates = getRatesSettings(statements);
+		const sourceQuery = req.query.source;
+
+		if (sourceQuery === 'energy_5m') {
+			const energyRows = statements.getEnergy5mInRange.all(range.from, range.to);
+			if (energyRows.length < 1) {
+				return res.status(400).json({
+					error: 'No energy_5m data found for requested range',
+				});
+			}
+
+			const bill = aggregateBillFromEnergyBuckets(energyRows, rates, range.from, range.to);
+			return res.json({ ...bill, source: 'energy_5m' });
+		}
+
+		if (sourceQuery === 'readings') {
+			const readings = statements.getHistoryInRange.all(range.from, range.to);
+			const bill = aggregateBillFromReadings(readings, rates, range.from, range.to);
+			return res.json({ ...bill, source: 'readings' });
+		}
+
+		if (sourceQuery !== undefined && sourceQuery !== null && sourceQuery !== '') {
+			return res.status(400).json({
+				error: 'Invalid source query param; expected readings|energy_5m',
+			});
+		}
+
+		const energyRows = statements.getEnergy5mInRange.all(range.from, range.to);
+		if (energyRows.length >= 1) {
+			const bill = aggregateBillFromEnergyBuckets(energyRows, rates, range.from, range.to);
+			return res.json({ ...bill, source: 'energy_5m' });
+		}
+
+		const readings = statements.getHistoryInRange.all(range.from, range.to);
 		const bill = aggregateBillFromReadings(readings, rates, range.from, range.to);
-		res.json(bill);
+		return res.json({ ...bill, source: 'readings' });
 	} catch (error) {
-		res.status(400).json({ error: error?.message || String(error) });
+		return res.status(400).json({ error: error?.message || String(error) });
 	}
 });
 
@@ -1060,6 +1092,15 @@ async function fetchPowerFlowReading(baseUrl) {
 }
 
 async function fetchArchiveEnergyBuckets(baseUrl, startLocalIso, endLocalIso) {
+	const buckets = await fetchArchiveDetail(baseUrl, startLocalIso, endLocalIso);
+	return buckets.map((bucket) => ({
+		offset_seconds: bucket.offsetSeconds,
+		import_wh: bucket.importWh,
+		export_wh: bucket.exportWh,
+	}));
+}
+
+async function fetchArchiveDetail(baseUrl, startLocalIso, endLocalIso) {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 15000);
 
@@ -1079,28 +1120,33 @@ async function fetchArchiveEnergyBuckets(baseUrl, startLocalIso, endLocalIso) {
 			headers: { Accept: 'application/json' },
 		});
 
-		if (!response.ok) {
+		if (response.status !== 200) {
 			throw new Error(`Fronius archive API error: HTTP ${response.status}`);
 		}
 
 		const payload = await response.json();
-		const statusCode = payload?.Head?.Status?.Code;
-		if (statusCode !== undefined && Number(statusCode) !== 0) {
+		const statusCode = Number(payload?.Head?.Status?.Code);
+		if (!Number.isFinite(statusCode) || statusCode !== 0) {
 			const statusReason = payload?.Head?.Status?.Reason;
-			throw new Error(`Fronius archive API status error: ${statusCode}${statusReason ? ` ${statusReason}` : ''}`);
+			throw new Error(`Fronius archive API status error: ${payload?.Head?.Status?.Code}${statusReason ? ` ${statusReason}` : ''}`);
 		}
 
-		if (!payload?.Body?.Data || typeof payload.Body.Data !== 'object') {
-			throw new Error('Fronius archive payload missing Body.Data');
-		}
-
-		return parseFroniusArchiveDetail(payload);
+		return parseArchiveDetail(payload);
 	} finally {
 		clearTimeout(timeout);
 	}
 }
 
 function parseFroniusArchiveDetail(payload) {
+	const buckets = parseArchiveDetail(payload);
+	return buckets.map((bucket) => ({
+		offset_seconds: bucket.offsetSeconds,
+		import_wh: bucket.importWh,
+		export_wh: bucket.exportWh,
+	}));
+}
+
+function parseArchiveDetail(payload) {
 	const bodyData = payload?.Body?.Data;
 	if (!bodyData || typeof bodyData !== 'object') {
 		throw new Error('Invalid archive payload: missing Body.Data');
@@ -1118,20 +1164,17 @@ function parseFroniusArchiveDetail(payload) {
 
 	const consumedSeries = nodeData.EnergyReal_WAC_Sum_Consumed;
 	const producedSeries = nodeData.EnergyReal_WAC_Sum_Produced;
-	if (!consumedSeries || !producedSeries) {
-		throw new Error('Invalid archive payload: required channels are missing');
-	}
 
-	if (consumedSeries.Unit !== 'Wh') {
+	if (consumedSeries?.Unit !== undefined && consumedSeries.Unit !== 'Wh') {
 		throw new Error(`Invalid unit for EnergyReal_WAC_Sum_Consumed: ${consumedSeries.Unit}`);
 	}
 
-	if (producedSeries.Unit !== 'Wh') {
+	if (producedSeries?.Unit !== undefined && producedSeries.Unit !== 'Wh') {
 		throw new Error(`Invalid unit for EnergyReal_WAC_Sum_Produced: ${producedSeries.Unit}`);
 	}
 
-	const consumedValues = consumedSeries.Values && typeof consumedSeries.Values === 'object' ? consumedSeries.Values : {};
-	const producedValues = producedSeries.Values && typeof producedSeries.Values === 'object' ? producedSeries.Values : {};
+	const consumedValues = consumedSeries?.Values && typeof consumedSeries.Values === 'object' ? consumedSeries.Values : {};
+	const producedValues = producedSeries?.Values && typeof producedSeries.Values === 'object' ? producedSeries.Values : {};
 
 	const offsets = new Set([...Object.keys(consumedValues), ...Object.keys(producedValues)]);
 	const buckets = Array.from(offsets)
@@ -1145,13 +1188,13 @@ function parseFroniusArchiveDetail(payload) {
 			const exportWh = safeNumber(producedValues[offsetKey], 0);
 
 			return {
-				offset_seconds: offsetSeconds,
-				import_wh: importWh,
-				export_wh: exportWh,
+				offsetSeconds,
+				importWh,
+				exportWh,
 			};
 		})
 		.filter((bucket) => bucket !== null)
-		.sort((a, b) => a.offset_seconds - b.offset_seconds);
+		.sort((a, b) => a.offsetSeconds - b.offsetSeconds);
 
 	return buckets;
 }
