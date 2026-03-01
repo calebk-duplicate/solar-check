@@ -224,7 +224,7 @@ api.get('/bill', (req, res) => {
 				});
 			}
 
-			const bill = aggregateBillFromEnergyBuckets(energyRows, rates, range.from, range.to);
+			const bill = aggregateBillFromEnergy5m(energyRows, rates, range.from, range.to);
 			return res.json({ ...bill, source: 'energy_5m' });
 		}
 
@@ -242,7 +242,7 @@ api.get('/bill', (req, res) => {
 
 		const energyRows = statements.getEnergy5mInRange.all(range.from, range.to);
 		if (energyRows.length >= 1) {
-			const bill = aggregateBillFromEnergyBuckets(energyRows, rates, range.from, range.to);
+			const bill = aggregateBillFromEnergy5m(energyRows, rates, range.from, range.to);
 			return res.json({ ...bill, source: 'energy_5m' });
 		}
 
@@ -698,11 +698,11 @@ function aggregateBillFromReadings(rows, rates, fromUtc, toUtc) {
 	};
 }
 
-function aggregateBillFromEnergyBuckets(rows, rates, fromUtc, toUtc) {
+function aggregateBillFromEnergy5m(rows, rates, fromUtcIso, toUtcIso) {
 	const timezone = rates.timezone;
 	const dailyMap = new Map();
 
-	for (const dayLocal of enumerateLocalDaysInRange(fromUtc, toUtc, timezone)) {
+	for (const dayLocal of enumerateLocalDaysInRange(fromUtcIso, toUtcIso, timezone)) {
 		dailyMap.set(dayLocal, {
 			day_local: dayLocal,
 			import_kwh: 0,
@@ -769,8 +769,8 @@ function aggregateBillFromEnergyBuckets(rows, rates, fromUtc, toUtc) {
 		});
 
 	const summary = {
-		from_utc: fromUtc,
-		to_utc: toUtc,
+		from_utc: fromUtcIso,
+		to_utc: toUtcIso,
 		days: days.length,
 		total_import_kwh: round3(days.reduce((sum, day) => sum + day.import_kwh, 0)),
 		total_export_kwh: round3(days.reduce((sum, day) => sum + day.export_kwh, 0)),
