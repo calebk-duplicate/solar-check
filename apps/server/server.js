@@ -4,6 +4,17 @@ require('dotenv').config({ path: path.join(__dirname, '.env') });
 const cors = require('cors');
 const express = require('express');
 const Database = require('better-sqlite3');
+const { DateTime } = require('luxon');
+
+const DEFAULT_DAILY_FIXED_CENTS = 0;
+const DEFAULT_TIMEZONE = 'Pacific/Auckland';
+const DEFAULT_IMPORT_PERIODS = [
+	{ days: 'all', start: '00:00', end: '21:00', cents_per_kwh: 32 },
+	{ days: 'all', start: '21:00', end: '24:00', cents_per_kwh: 0 },
+];
+const DEFAULT_EXPORT_PERIODS = [
+	{ days: 'all', start: '00:00', end: '24:00', cents_per_kwh: 12 },
+];
 
 const INVERTER_BASE_URL = (process.env.INVERTER_BASE_URL || '').replace(/\/$/, '');
 const POLL_SECONDS = Number.parseInt(process.env.POLL_SECONDS || '15', 10);
@@ -23,6 +34,7 @@ if (!Number.isFinite(PORT) || PORT <= 0) {
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 const DB_FILE = path.join(__dirname, 'solarcheck.db');
 const db = new Database(DB_FILE);
 const DASHBOARD_DIST_DIR = path.resolve(__dirname, '../dashboard/dist');
@@ -44,6 +56,7 @@ const state = {
 initializeDatabase(db);
 
 const statements = prepareStatements(db);
+ensureDefaultSettings(statements);
 
 const api = express.Router();
 
@@ -71,17 +84,78 @@ api.get('/live', (_req, res) => {
 		});
 	}
 
+	const rates = getRatesSettings(statements);
+	const nowLocal = DateTime.now().setZone(rates.timezone);
+	const hhmm = nowLocal.isValid ? nowLocal.toFormat('HH:mm') : '00:00';
+	const dayGroup = nowLocal.isValid ? dayGroupFromLocalDateTime(nowLocal) : 'weekday';
+	const importRate = findRateForTime(rates.import_periods, dayGroup, hhmm);
+	const exportRate = findRateForTime(rates.export_periods, dayGroup, hhmm);
+	const importCostPerHour = (row.grid_import_w / 1000) * importRate;
+	const exportCreditPerHour = (row.grid_export_w / 1000) * exportRate;
+	const netCostPerHour = importCostPerHour - exportCreditPerHour + rates.daily_fixed_cents / 24;
+
 	const data = withDerivedValues(row);
 	const explanation = getLiveExplanation(data);
 
 	return res.json({
 		data: {
 			...data,
+			import_cost_per_hour: round3(importCostPerHour),
+			export_credit_per_hour: round3(exportCreditPerHour),
+			net_cost_per_hour: round3(netCostPerHour),
 			explanation,
 		},
 		data_warning: state.liveDataWarning,
 		explanation,
 	});
+});
+
+api.get('/rates', (_req, res) => {
+	const rates = getRatesSettings(statements);
+	res.json(rates);
+});
+
+api.put('/rates', (req, res) => {
+	try {
+		if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+			return res.status(400).json({ error: 'Request body must be a JSON object' });
+		}
+
+		const current = getRatesSettings(statements);
+		const next = { ...current };
+
+		if (Object.prototype.hasOwnProperty.call(req.body, 'daily_fixed_cents')) {
+			const dailyFixed = Number(req.body.daily_fixed_cents);
+			if (!Number.isFinite(dailyFixed) || dailyFixed < 0) {
+				return res.status(400).json({ error: 'daily_fixed_cents must be a number >= 0' });
+			}
+			next.daily_fixed_cents = dailyFixed;
+		}
+
+		if (Object.prototype.hasOwnProperty.call(req.body, 'timezone')) {
+			if (typeof req.body.timezone !== 'string' || !isValidTimezone(req.body.timezone)) {
+				return res.status(400).json({ error: 'timezone must be a valid IANA timezone string' });
+			}
+			next.timezone = req.body.timezone;
+		}
+
+		if (Object.prototype.hasOwnProperty.call(req.body, 'import_periods')) {
+			next.import_periods = validateRatePeriods(req.body.import_periods, 'import_periods');
+		}
+
+		if (Object.prototype.hasOwnProperty.call(req.body, 'export_periods')) {
+			next.export_periods = validateRatePeriods(req.body.export_periods, 'export_periods');
+		}
+
+		statements.upsertSetting.run('daily_fixed_cents', JSON.stringify(next.daily_fixed_cents));
+		statements.upsertSetting.run('timezone', JSON.stringify(next.timezone));
+		statements.upsertSetting.run('import_periods_json', JSON.stringify(next.import_periods));
+		statements.upsertSetting.run('export_periods_json', JSON.stringify(next.export_periods));
+
+		return res.json(next);
+	} catch (error) {
+		return res.status(400).json({ error: error?.message || String(error) });
+	}
 });
 
 api.get('/history', (req, res) => {
@@ -102,6 +176,18 @@ api.get('/daily', (req, res) => {
 	const daily = aggregateDailyFromReadings(readings);
 
 	res.json(daily);
+});
+
+api.get('/bill', (req, res) => {
+	try {
+		const range = parseRange(req.query.from, req.query.to, 24 * 7);
+		const readings = statements.getHistoryInRange.all(range.from, range.to);
+		const rates = getRatesSettings(statements);
+		const daily = aggregateBillFromReadings(readings, rates);
+		res.json(daily);
+	} catch (error) {
+		res.status(400).json({ error: error?.message || String(error) });
+	}
 });
 
 app.use('/api', api);
@@ -166,6 +252,11 @@ function initializeDatabase(database) {
 			export_kwh REAL,
 			self_kwh REAL
 		);
+
+		CREATE TABLE IF NOT EXISTS settings (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		);
 	`);
 }
 
@@ -214,7 +305,259 @@ function prepareStatements(database) {
 			WHERE ts_utc >= ? AND ts_utc < ?
 			ORDER BY ts_utc ASC
 		`),
+		getSetting: database.prepare(`
+			SELECT value
+			FROM settings
+			WHERE key = ?
+		`),
+		upsertSetting: database.prepare(`
+			INSERT INTO settings (key, value)
+			VALUES (?, ?)
+			ON CONFLICT(key) DO UPDATE SET
+				value = excluded.value
+		`),
 	};
+}
+
+function ensureDefaultSettings(prepared) {
+	const defaults = [
+		['daily_fixed_cents', JSON.stringify(DEFAULT_DAILY_FIXED_CENTS)],
+		['timezone', JSON.stringify(DEFAULT_TIMEZONE)],
+		['import_periods_json', JSON.stringify(DEFAULT_IMPORT_PERIODS)],
+		['export_periods_json', JSON.stringify(DEFAULT_EXPORT_PERIODS)],
+	];
+
+	for (const [key, defaultValue] of defaults) {
+		const existing = prepared.getSetting.get(key);
+		if (!existing) {
+			prepared.upsertSetting.run(key, defaultValue);
+		}
+	}
+}
+
+function getRatesSettings(prepared) {
+	const dailyFixedRaw = parseJsonSetting(prepared.getSetting.get('daily_fixed_cents')?.value, DEFAULT_DAILY_FIXED_CENTS);
+	const timezoneRaw = parseJsonSetting(prepared.getSetting.get('timezone')?.value, DEFAULT_TIMEZONE);
+	const importRaw = parseJsonSetting(prepared.getSetting.get('import_periods_json')?.value, DEFAULT_IMPORT_PERIODS);
+	const exportRaw = parseJsonSetting(prepared.getSetting.get('export_periods_json')?.value, DEFAULT_EXPORT_PERIODS);
+
+	const dailyFixed = Number(dailyFixedRaw);
+	const timezone = typeof timezoneRaw === 'string' && isValidTimezone(timezoneRaw) ? timezoneRaw : DEFAULT_TIMEZONE;
+
+	return {
+		daily_fixed_cents: Number.isFinite(dailyFixed) && dailyFixed >= 0 ? dailyFixed : DEFAULT_DAILY_FIXED_CENTS,
+		timezone,
+		import_periods: validateRatePeriods(importRaw, 'import_periods'),
+		export_periods: validateRatePeriods(exportRaw, 'export_periods'),
+	};
+}
+
+function parseJsonSetting(rawValue, fallback) {
+	if (typeof rawValue !== 'string') {
+		return fallback;
+	}
+
+	try {
+		return JSON.parse(rawValue);
+	} catch {
+		return fallback;
+	}
+}
+
+function isValidTimezone(zone) {
+	return DateTime.now().setZone(zone).isValid;
+}
+
+function validateRatePeriods(periods, label) {
+	if (!Array.isArray(periods) || periods.length === 0) {
+		throw new Error(`${label} must be a non-empty array`);
+	}
+
+	const normalized = periods.map((period, index) => {
+		if (!period || typeof period !== 'object') {
+			throw new Error(`${label}[${index}] must be an object`);
+		}
+
+		const days = normalizeDayGroup(period.days);
+		const { start, end } = period;
+		const cents = Number(period.cents_per_kwh);
+		if (typeof start !== 'string' || typeof end !== 'string') {
+			throw new Error(`${label}[${index}] start and end must be HH:mm strings`);
+		}
+		if (!Number.isFinite(cents) || cents < 0) {
+			throw new Error(`${label}[${index}] cents_per_kwh must be >= 0`);
+		}
+
+		const startMinutes = parseTimeToMinutes(start, false);
+		const endMinutes = parseTimeToMinutes(end, true);
+		if (endMinutes <= startMinutes) {
+			throw new Error(`${label}[${index}] end must be after start`);
+		}
+
+		return {
+			days,
+			start,
+			end,
+			cents_per_kwh: cents,
+		};
+	});
+
+	for (const dayGroup of ['all', 'weekday', 'weekend']) {
+		const sorted = normalized
+			.filter((period) => period.days === dayGroup)
+			.map((period) => ({
+				start: parseTimeToMinutes(period.start, false),
+				end: parseTimeToMinutes(period.end, true),
+			}))
+			.sort((a, b) => a.start - b.start);
+
+		for (let index = 1; index < sorted.length; index += 1) {
+			if (sorted[index - 1].end > sorted[index].start) {
+				console.warn(`[rates] ${label} contains overlapping periods for ${dayGroup}; first matching period will be used`);
+				break;
+			}
+		}
+	}
+
+	return normalized;
+}
+
+function normalizeDayGroup(days) {
+	if (days === undefined || days === null || days === '') {
+		return 'all';
+	}
+
+	if (days !== 'all' && days !== 'weekday' && days !== 'weekend') {
+		throw new Error(`Invalid days value: ${days}; expected all|weekday|weekend`);
+	}
+
+	return days;
+}
+
+function parseTimeToMinutes(hhmm, allow2400) {
+	if (!/^\d{2}:\d{2}$/.test(hhmm)) {
+		throw new Error(`Invalid time format: ${hhmm}; expected HH:mm`);
+	}
+
+	const [hourRaw, minuteRaw] = hhmm.split(':');
+	const hour = Number(hourRaw);
+	const minute = Number(minuteRaw);
+
+	if (!Number.isInteger(hour) || !Number.isInteger(minute) || minute < 0 || minute > 59) {
+		throw new Error(`Invalid time value: ${hhmm}`);
+	}
+
+	if (allow2400 && hour === 24 && minute === 0) {
+		return 24 * 60;
+	}
+
+	if (hour < 0 || hour > 23) {
+		throw new Error(`Invalid hour in time: ${hhmm}`);
+	}
+
+	return hour * 60 + minute;
+}
+
+function findRateForTime(periods, dayGroup, hhmm) {
+	const timeMinutes = parseTimeToMinutes(hhmm, false);
+	const exactMatchRate = findRateForDayGroup(periods, dayGroup, timeMinutes);
+	if (exactMatchRate !== null) {
+		return exactMatchRate;
+	}
+
+	const allDaysRate = findRateForDayGroup(periods, 'all', timeMinutes);
+	if (allDaysRate !== null) {
+		return allDaysRate;
+	}
+
+	return Number(periods[periods.length - 1].cents_per_kwh);
+}
+
+function findRateForDayGroup(periods, dayGroup, timeMinutes) {
+	for (const period of periods) {
+		if (normalizeDayGroup(period.days) !== dayGroup) {
+			continue;
+		}
+
+		const startMinutes = parseTimeToMinutes(period.start, false);
+		const endMinutes = parseTimeToMinutes(period.end, true);
+		if (timeMinutes >= startMinutes && timeMinutes < endMinutes) {
+			return Number(period.cents_per_kwh);
+		}
+	}
+
+	return null;
+}
+
+function dayGroupFromLocalDateTime(localDateTime) {
+	return localDateTime.weekday === 6 || localDateTime.weekday === 7 ? 'weekend' : 'weekday';
+}
+
+function aggregateBillFromReadings(rows, rates) {
+	if (!rows || rows.length < 2) {
+		return [];
+	}
+
+	const dailyMap = new Map();
+
+	for (let index = 1; index < rows.length; index += 1) {
+		const prev = rows[index - 1];
+		const curr = rows[index];
+
+		const prevTs = Date.parse(prev.ts_utc);
+		const currTs = Date.parse(curr.ts_utc);
+		if (!Number.isFinite(prevTs) || !Number.isFinite(currTs) || currTs <= prevTs) {
+			continue;
+		}
+
+		const hours = (currTs - prevTs) / 3600000;
+		const importKwh = (prev.grid_import_w / 1000) * hours;
+		const exportKwh = (prev.grid_export_w / 1000) * hours;
+
+		const localTime = DateTime.fromISO(prev.ts_utc, { zone: 'utc' }).setZone(rates.timezone);
+		if (!localTime.isValid) {
+			continue;
+		}
+
+		const hhmm = localTime.toFormat('HH:mm');
+		const dayLocal = localTime.toFormat('yyyy-LL-dd');
+		const dayGroup = dayGroupFromLocalDateTime(localTime);
+		const importRate = findRateForTime(rates.import_periods, dayGroup, hhmm);
+		const exportRate = findRateForTime(rates.export_periods, dayGroup, hhmm);
+
+		if (!dailyMap.has(dayLocal)) {
+			dailyMap.set(dayLocal, {
+				day_local: dayLocal,
+				import_kwh: 0,
+				export_kwh: 0,
+				import_cost: 0,
+				export_credit: 0,
+				fixed_charge: rates.daily_fixed_cents,
+				net_cost: 0,
+			});
+		}
+
+		const bucket = dailyMap.get(dayLocal);
+		bucket.import_kwh += importKwh;
+		bucket.export_kwh += exportKwh;
+		bucket.import_cost += importKwh * importRate;
+		bucket.export_credit += exportKwh * exportRate;
+	}
+
+	return Array.from(dailyMap.values())
+		.sort((a, b) => a.day_local.localeCompare(b.day_local))
+		.map((item) => {
+			const netCost = item.import_cost - item.export_credit + item.fixed_charge;
+			return {
+				day_local: item.day_local,
+				import_kwh: round3(item.import_kwh),
+				export_kwh: round3(item.export_kwh),
+				import_cost: round3(item.import_cost),
+				export_credit: round3(item.export_credit),
+				fixed_charge: round3(item.fixed_charge),
+				net_cost: round3(netCost),
+			};
+		});
 }
 
 function parseRange(fromRaw, toRaw, fallbackHours) {
