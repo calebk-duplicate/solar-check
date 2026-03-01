@@ -59,6 +59,7 @@ const state = {
 	lastError: null,
 	lastReadingTsUtc: null,
 	lastArchiveBackfillAtUtc: null,
+	lastArchiveBackfillSuccessAtUtc: null,
 	lastArchiveBackfillError: null,
 	pollingInProgress: false,
 	archiveBackfillInProgress: false,
@@ -84,7 +85,23 @@ api.get('/health', (_req, res) => {
 		last_reading_ts_utc: state.lastReadingTsUtc,
 		last_error: state.lastError,
 		last_archive_backfill_at_utc: state.lastArchiveBackfillAtUtc,
+		last_archive_backfill_success_at_utc: state.lastArchiveBackfillSuccessAtUtc,
 		last_archive_backfill_error: state.lastArchiveBackfillError,
+	});
+});
+
+api.get('/settings', (_req, res) => {
+	const rates = getRatesSettings(statements);
+	res.json({
+		...rates,
+		archive_backfill_minutes: ARCHIVE_BACKFILL_MINUTES,
+		archive_lookback_days: ARCHIVE_LOOKBACK_DAYS,
+		archive_backfill: {
+			last_attempt_at_utc: state.lastArchiveBackfillAtUtc,
+			last_success_at_utc: state.lastArchiveBackfillSuccessAtUtc,
+			last_error: state.lastArchiveBackfillError,
+			in_progress: state.archiveBackfillInProgress,
+		},
 	});
 });
 
@@ -953,8 +970,8 @@ async function backfillArchiveOnce() {
 	state.lastArchiveBackfillAtUtc = new Date().toISOString();
 
 	try {
-		const rates = getRatesSettings(statements);
-		const timezone = rates.timezone;
+		const settings = getRatesSettings(statements);
+		const timezone = settings.timezone || DEFAULT_TIMEZONE;
 		const nowLocal = DateTime.now().setZone(timezone);
 		if (!nowLocal.isValid) {
 			throw new Error(`Invalid timezone for archive backfill: ${timezone}`);
@@ -969,33 +986,29 @@ async function backfillArchiveOnce() {
 			throw new Error('Failed to compute archive backfill range');
 		}
 
-		const buckets = await fetchArchiveEnergyBuckets(INVERTER_BASE_URL, startLocalIso, endLocalIso);
-		const secondsPerDay = 24 * 60 * 60;
+		const buckets = await fetchArchiveDetail(INVERTER_BASE_URL, startLocalIso, endLocalIso);
 		let upsertedCount = 0;
 
 		for (const bucket of buckets) {
-			const totalOffsetSeconds = Number.parseInt(String(bucket.offset_seconds), 10);
+			const totalOffsetSeconds = Number.parseInt(String(bucket.offsetSeconds), 10);
 			if (!Number.isInteger(totalOffsetSeconds) || totalOffsetSeconds < 0) {
 				continue;
 			}
 
-			const dayOffset = Math.floor(totalOffsetSeconds / secondsPerDay);
-			const secondsIntoDay = totalOffsetSeconds % secondsPerDay;
-			const bucketDayStartLocal = localStart.plus({ days: dayOffset }).startOf('day');
-			const bucketLocal = bucketDayStartLocal.plus({ seconds: secondsIntoDay });
+			const bucketLocal = localStart.plus({ seconds: totalOffsetSeconds });
 			if (!bucketLocal.isValid) {
 				continue;
 			}
 
-			const tsUtc = bucketLocal.toUTC().toISO();
+			const tsUtc = bucketLocal.toUTC().toISO({ suppressMilliseconds: true });
 			if (!tsUtc) {
 				continue;
 			}
 
 			const result = statements.upsertEnergy5m.run({
 				ts_utc: tsUtc,
-				import_wh: bucket.import_wh,
-				export_wh: bucket.export_wh,
+				import_wh: bucket.importWh,
+				export_wh: bucket.exportWh,
 			});
 
 			if (result.changes > 0) {
@@ -1004,6 +1017,7 @@ async function backfillArchiveOnce() {
 		}
 
 		state.lastArchiveBackfillError = null;
+		state.lastArchiveBackfillSuccessAtUtc = new Date().toISOString();
 		state.lastArchiveBackfillAtUtc = new Date().toISOString();
 		console.log(
 			`[archive] upserted ${upsertedCount} buckets for ${startLocalIso} -> ${endLocalIso} (${timezone})`,
