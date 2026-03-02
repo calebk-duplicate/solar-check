@@ -6,6 +6,7 @@ import { StatusBadge } from '../components/StatusBadge'
 import { HistoryChart } from '../components/HistoryChart'
 import { RatesEditor } from '../components/RatesEditor'
 import { BillEstimate } from '../components/BillEstimate'
+import { BackfillPanel } from '../components/BackfillPanel'
 import { determineStatus, formatWatts, formatTimestamp, formatKWh, formatCurrency } from '../utils/format'
 import { subHours } from 'date-fns'
 
@@ -260,6 +261,8 @@ export function Dashboard() {
         )}
 
         <BillEstimate freeImport={freeImport} />
+
+        <BackfillPanel />
 
         {rates && (
           <RatesEditor
