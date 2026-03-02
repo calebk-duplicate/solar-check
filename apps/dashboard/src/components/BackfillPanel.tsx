@@ -73,7 +73,7 @@ export function BackfillPanel() {
     <div className="bg-gray-800 border border-gray-700 rounded-lg p-6 mb-8">
       <h3 className="text-lg font-semibold mb-4">Archive Backfill</h3>
 
-      <div className="flex flex-wrap items-end gap-4 mb-4">
+      <div className="flex flex-wrap items-end gap-4 mb-1">
         <div>
           <label className="block text-sm text-gray-400 mb-1">Start Month</label>
           <input
@@ -105,6 +105,8 @@ export function BackfillPanel() {
         </button>
       </div>
 
+      <p className="text-xs text-gray-500 mb-4">Starts from the 1st of the selected month (NZ time).</p>
+
       {notice && (
         <div className="mb-4 p-3 bg-amber-900/40 border border-amber-700 rounded text-amber-300 text-sm">
           {notice}
@@ -113,6 +115,13 @@ export function BackfillPanel() {
 
       {status && (
         <div className="space-y-2">
+          {status.range && (
+            <p className="text-xs text-gray-500">
+              Range: {status.range.start_local} &rarr; {status.range.end_local}{' '}
+              <span className="text-gray-600">({status.range.timezone})</span>
+            </p>
+          )}
+
           {status.running && (
             <>
               <div className="w-full bg-gray-700 rounded-full h-2">
