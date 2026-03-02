@@ -134,3 +134,45 @@ export async function fetchEnergy5m(
   }
   return (await response.json()) as Energy5mResponse
 }
+
+export type BackfillRequest = { start_month: string; months: number }
+export type BackfillStatus = {
+  running: boolean
+  started_at_utc?: string
+  completed_at_utc?: string
+  last_error?: string
+  range?: { start_local: string; end_local: string; timezone: string }
+  progress?: {
+    total_days: number
+    completed_days: number
+    total_requests: number
+    completed_requests: number
+    rows_upserted: number
+  }
+}
+
+export async function startArchiveBackfill(req: BackfillRequest): Promise<BackfillStatus> {
+  const response = await fetch('/api/archive/backfill', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(req),
+  })
+  if (!response.ok) {
+    let msg = `HTTP ${response.status}: ${response.statusText}`
+    try {
+      const body = (await response.json()) as { error?: string; message?: string }
+      if (body.error) msg = body.error
+      else if (body.message) msg = body.message
+    } catch { /* ignore */ }
+    throw new Error(msg)
+  }
+  return (await response.json()) as BackfillStatus
+}
+
+export async function getArchiveBackfillStatus(): Promise<BackfillStatus> {
+  const response = await fetch('/api/archive/backfill/status')
+  if (!response.ok) {
+    throw new Error(`HTTP ${response.status}: ${response.statusText}`)
+  }
+  return (await response.json()) as BackfillStatus
+}
