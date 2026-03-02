@@ -344,6 +344,15 @@ api.get('/bill', (req, res) => {
 
 api.post('/archive/backfill', (req, res) => {
 	try {
+		if (state.archiveBackfillInProgress) {
+			return res.status(409).json({
+				error: 'busy',
+				message: 'Automatic archive backfill is running',
+				automatic_running: true,
+				manual_status: getManualArchiveBackfillStatus(),
+			});
+		}
+
 		if (state.manualArchiveBackfill.running) {
 			return res.status(409).json(getManualArchiveBackfillStatus());
 		}
@@ -1097,6 +1106,11 @@ function startArchiveBackfill() {
 }
 
 async function backfillArchiveOnce() {
+	if (state.manualArchiveBackfill.running) {
+		console.log('[archive] skipped: manual backfill is in progress');
+		return;
+	}
+
 	if (state.archiveBackfillInProgress) {
 		console.log('[archive] skipped: previous backfill still in progress');
 		return;
