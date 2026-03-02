@@ -1180,13 +1180,13 @@ function getManualArchiveBackfillStatus() {
 }
 
 function buildManualArchiveBackfillRange(startMonth, months, timezone) {
-	if (typeof startMonth !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(startMonth)) {
+	if (typeof startMonth !== 'string' || !/^\d{4}-\d{2}$/.test(startMonth)) {
 		throw new Error('start_month must be in YYYY-MM format');
 	}
 
 	const monthsNumber = Number(months);
-	if (!Number.isInteger(monthsNumber) || monthsNumber < 1 || monthsNumber > MANUAL_ARCHIVE_MAX_MONTHS) {
-		throw new Error(`months must be an integer in range 1..${MANUAL_ARCHIVE_MAX_MONTHS}`);
+	if (!Number.isInteger(monthsNumber) || monthsNumber < 1 || monthsNumber > 24) {
+		throw new Error('months must be an integer in range 1..24');
 	}
 
 	const startLocal = DateTime.fromFormat(`${startMonth}-01 00:00:00`, 'yyyy-LL-dd HH:mm:ss', { zone: timezone });
