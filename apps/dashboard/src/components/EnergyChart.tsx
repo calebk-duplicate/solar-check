@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid,
+  ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid,
   Tooltip, Legend, ResponsiveContainer, ReferenceArea,
 } from 'recharts'
 import { fetchEnergy5m, getRates } from '../api/client'
@@ -26,21 +26,21 @@ function isWeekendTs(tsMs: number, timezone: string): boolean {
 }
 
 /**
- * Returns true if tsMs falls within any of the supplied zero-rate periods.
- * Period times are HH:mm strings; "24:00" is treated as end-of-day.
- * String comparison is safe here because times are always zero-padded HH:MM.
+ * Returns the applicable import rate (cents/kWh) for tsMs.
+ * Period times are HH:mm strings; "24:00" is a valid end-of-day sentinel.
+ * String comparison is safe because all times are zero-padded HH:MM.
+ * Returns 0 if no period matches.
  */
-function isZeroRate(tsMs: number, zeroPeriods: RatePeriod[], timezone: string): boolean {
+function getImportRateCents(tsMs: number, importPeriods: RatePeriod[], timezone: string): number {
   const hhmm = localHHMM(tsMs, timezone)
   const dayType = isWeekendTs(tsMs, timezone) ? 'weekend' : 'weekday'
 
-  for (const p of zeroPeriods) {
+  for (const p of importPeriods) {
     const applies = !p.days || p.days === 'all' || p.days === dayType
     if (!applies) continue
-    // "24:00" > any "HH:MM", so the upper-bound check works with plain string compare
-    if (hhmm >= p.start && hhmm < p.end) return true
+    if (hhmm >= p.start && hhmm < p.end) return p.cents_per_kwh
   }
-  return false
+  return 0
 }
 
 interface ShadedBand { x1: number; x2: number }
@@ -51,16 +51,16 @@ interface ShadedBand { x1: number; x2: number }
  */
 function buildShadedBands(
   chartData: ChartPoint[],
-  zeroPeriods: RatePeriod[],
+  importPeriods: RatePeriod[],
   timezone: string,
 ): ShadedBand[] {
-  if (zeroPeriods.length === 0 || chartData.length === 0) return []
+  if (importPeriods.length === 0 || chartData.length === 0) return []
 
   const bands: ShadedBand[] = []
   let bandStart: number | null = null
 
   for (const point of chartData) {
-    if (isZeroRate(point.ts, zeroPeriods, timezone)) {
+    if (getImportRateCents(point.ts, importPeriods, timezone) === 0) {
       if (bandStart === null) bandStart = point.ts
     } else if (bandStart !== null) {
       bands.push({ x1: bandStart, x2: point.ts })
@@ -77,9 +77,10 @@ function buildShadedBands(
 // ── chart data type ───────────────────────────────────────────────────────────
 
 interface ChartPoint {
-  ts: number      // epoch ms — used as the XAxis dataKey and for ReferenceArea bounds
-  Import: number
-  Export: number
+  ts: number      // epoch ms — XAxis dataKey and ReferenceArea bounds
+  Import: number  // kWh
+  Export: number  // kWh
+  Cost: number    // dollars (import only)
 }
 
 // ── component ─────────────────────────────────────────────────────────────────
@@ -96,6 +97,7 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
   const [timezone, setTimezone] = useState('UTC')
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [showCost, setShowCost] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -104,13 +106,19 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
     Promise.all([fetchEnergy5m(fromIso, toIso), getRates()])
       .then(([energy, rates]) => {
         const tz = rates.timezone
-        const zeroPeriods = rates.import_periods.filter((p) => p.cents_per_kwh === 0)
+        const importPeriods = rates.import_periods
 
-        const points: ChartPoint[] = energy.data.map((pt) => ({
-          ts: new Date(pt.ts_utc).getTime(),
-          Import: +(pt.import_wh / 1000).toFixed(4),
-          Export: +(pt.export_wh / 1000).toFixed(4),
-        }))
+        const points: ChartPoint[] = energy.data.map((pt) => {
+          const tsMs = new Date(pt.ts_utc).getTime()
+          const importKwh = pt.import_wh / 1000
+          const rateCents = getImportRateCents(tsMs, importPeriods, tz)
+          return {
+            ts: tsMs,
+            Import: +importKwh.toFixed(4),
+            Export: +(pt.export_wh / 1000).toFixed(4),
+            Cost: +(importKwh * rateCents / 100).toFixed(6),
+          }
+        })
 
         // One tick per hour — where local time is HH:00
         const hourlyTicks = points
@@ -120,7 +128,7 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
         setTimezone(tz)
         setChartData(points)
         setTicks(hourlyTicks)
-        setShadedBands(buildShadedBands(points, zeroPeriods, tz))
+        setShadedBands(buildShadedBands(points, importPeriods, tz))
       })
       .catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
       .finally(() => setLoading(false))
@@ -128,12 +136,26 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
 
   return (
     <div className="bg-gray-800 border border-gray-700 rounded-lg p-6">
-      <h3 className="text-lg font-semibold text-white mb-4">Energy (5-min buckets)</h3>
+      <div className="flex items-center justify-between mb-4">
+        <h3 className="text-lg font-semibold text-white">Energy (5-min buckets)</h3>
+        {!loading && !error && (
+          <label className="flex items-center gap-2 text-sm text-gray-300 cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={showCost}
+              onChange={(e) => setShowCost(e.target.checked)}
+              className="accent-blue-400"
+            />
+            Show import cost
+          </label>
+        )}
+      </div>
+
       {loading && <p className="text-gray-400 text-sm">Loading…</p>}
       {error && <p className="text-red-400 text-sm">{error}</p>}
       {!loading && !error && (
         <ResponsiveContainer width="100%" height={300}>
-          <AreaChart data={chartData}>
+          <ComposedChart data={chartData}>
             <CartesianGrid strokeDasharray="3 3" stroke="#374151" />
 
             {/* Shaded bands for zero-import-rate windows */}
@@ -158,11 +180,27 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
               stroke="#9CA3AF"
               tick={{ fill: '#9CA3AF', fontSize: 12 }}
             />
+
+            {/* Left Y-axis: kWh */}
             <YAxis
+              yAxisId="energy"
               stroke="#9CA3AF"
               tick={{ fill: '#9CA3AF', fontSize: 12 }}
               label={{ value: 'kWh', angle: -90, position: 'insideLeft', fill: '#9CA3AF' }}
             />
+
+            {/* Right Y-axis: cost — only mounted when overlay is active */}
+            {showCost && (
+              <YAxis
+                yAxisId="cost"
+                orientation="right"
+                stroke="#60A5FA"
+                tick={{ fill: '#60A5FA', fontSize: 12 }}
+                tickFormatter={(v: number) => `$${v.toFixed(3)}`}
+                label={{ value: 'Cost ($)', angle: 90, position: 'insideRight', fill: '#60A5FA', offset: 10 }}
+              />
+            )}
+
             <Tooltip
               contentStyle={{
                 backgroundColor: '#1F2937',
@@ -172,10 +210,15 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
               }}
               labelStyle={{ color: '#F9FAFB' }}
               labelFormatter={(ts: number) => localHHMM(ts, timezone)}
-              formatter={(value: number) => [`${value.toFixed(4)} kWh`]}
+              formatter={(value: number, name: string) => {
+                if (name === 'Cost') return [`$${value.toFixed(4)}`, 'Cost']
+                return [`${value.toFixed(4)} kWh`, name]
+              }}
             />
             <Legend wrapperStyle={{ color: '#F9FAFB' }} />
+
             <Area
+              yAxisId="energy"
               type="monotone"
               dataKey="Import"
               stroke="#EF4444"
@@ -185,6 +228,7 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
               dot={false}
             />
             <Area
+              yAxisId="energy"
               type="monotone"
               dataKey="Export"
               stroke="#22C55E"
@@ -193,7 +237,19 @@ export function EnergyChart({ fromIso, toIso }: EnergyChartProps) {
               strokeWidth={1.5}
               dot={false}
             />
-          </AreaChart>
+
+            {showCost && (
+              <Line
+                yAxisId="cost"
+                type="monotone"
+                dataKey="Cost"
+                stroke="#60A5FA"
+                strokeWidth={1.5}
+                dot={false}
+                isAnimationActive={false}
+              />
+            )}
+          </ComposedChart>
         </ResponsiveContainer>
       )}
     </div>

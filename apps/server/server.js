@@ -21,6 +21,8 @@ const POLL_SECONDS = Number.parseInt(process.env.POLL_SECONDS || '15', 10);
 const PORT = Number.parseInt(process.env.PORT || '8080', 10);
 const ARCHIVE_BACKFILL_MINUTES = Number.parseInt(process.env.ARCHIVE_BACKFILL_MINUTES || '30', 10);
 const ARCHIVE_LOOKBACK_DAYS = Number.parseInt(process.env.ARCHIVE_LOOKBACK_DAYS || '2', 10);
+const MANUAL_ARCHIVE_MAX_MONTHS = Number.parseInt(process.env.MANUAL_ARCHIVE_MAX_MONTHS || '24', 10);
+const MANUAL_ARCHIVE_CHUNK_DAYS = Number.parseInt(process.env.MANUAL_ARCHIVE_CHUNK_DAYS || '2', 10);
 
 if (!INVERTER_BASE_URL) {
 	throw new Error('Missing required environment variable: INVERTER_BASE_URL');
@@ -40,6 +42,14 @@ if (!Number.isFinite(ARCHIVE_BACKFILL_MINUTES) || ARCHIVE_BACKFILL_MINUTES <= 0)
 
 if (!Number.isFinite(ARCHIVE_LOOKBACK_DAYS) || ARCHIVE_LOOKBACK_DAYS <= 0) {
 	throw new Error('ARCHIVE_LOOKBACK_DAYS must be a positive integer');
+}
+
+if (!Number.isFinite(MANUAL_ARCHIVE_MAX_MONTHS) || MANUAL_ARCHIVE_MAX_MONTHS <= 0) {
+	throw new Error('MANUAL_ARCHIVE_MAX_MONTHS must be a positive integer');
+}
+
+if (!Number.isFinite(MANUAL_ARCHIVE_CHUNK_DAYS) || MANUAL_ARCHIVE_CHUNK_DAYS <= 0) {
+	throw new Error('MANUAL_ARCHIVE_CHUNK_DAYS must be a positive integer');
 }
 
 const app = express();
@@ -63,6 +73,20 @@ const state = {
 	lastArchiveBackfillError: null,
 	pollingInProgress: false,
 	archiveBackfillInProgress: false,
+	manualArchiveBackfill: {
+		running: false,
+		startedAtUtc: null,
+		completedAtUtc: null,
+		lastError: null,
+		range: null,
+		progress: {
+			total_days: 0,
+			completed_days: 0,
+			total_requests: 0,
+			completed_requests: 0,
+			rows_upserted: 0,
+		},
+	},
 	consecutiveZeroLoadWithPv: 0,
 	liveDataWarning: null,
 };
@@ -316,6 +340,54 @@ api.get('/bill', (req, res) => {
 	} catch (error) {
 		return res.status(400).json({ error: error?.message || String(error) });
 	}
+});
+
+api.post('/archive/backfill', (req, res) => {
+	try {
+		if (state.manualArchiveBackfill.running) {
+			return res.status(409).json(getManualArchiveBackfillStatus());
+		}
+
+		if (!req.body || typeof req.body !== 'object' || Array.isArray(req.body)) {
+			return res.status(400).json({ error: 'Request body must be a JSON object' });
+		}
+
+		const { start_month: startMonth, months } = req.body;
+		const settings = getRatesSettings(statements);
+		const timezone = settings.timezone || DEFAULT_TIMEZONE;
+		const range = buildManualArchiveBackfillRange(startMonth, months, timezone);
+
+		state.manualArchiveBackfill = {
+			running: true,
+			startedAtUtc: new Date().toISOString(),
+			completedAtUtc: null,
+			lastError: null,
+			range,
+			progress: {
+				total_days: range.total_days,
+				completed_days: 0,
+				total_requests: range.total_requests,
+				completed_requests: 0,
+				rows_upserted: 0,
+			},
+		};
+
+		void runManualArchiveBackfillJob(range).catch((error) => {
+			const message = error?.message || String(error);
+			state.manualArchiveBackfill.lastError = message;
+			state.manualArchiveBackfill.completedAtUtc = new Date().toISOString();
+			state.manualArchiveBackfill.running = false;
+			console.error('[archive-manual] failed:', error);
+		});
+
+		return res.status(202).json(getManualArchiveBackfillStatus());
+	} catch (error) {
+		return res.status(400).json({ error: error?.message || String(error) });
+	}
+});
+
+api.get('/archive/backfill/status', (_req, res) => {
+	res.json(getManualArchiveBackfillStatus());
 });
 
 app.use('/api', api);
@@ -1044,13 +1116,13 @@ async function backfillArchiveOnce() {
 		const localStart = nowLocal.minus({ days: ARCHIVE_LOOKBACK_DAYS - 1 }).startOf('day');
 		const localEnd = nowLocal.endOf('day');
 
-		const startLocalIso = localStart.toISO();
-		const endLocalIso = localEnd.toISO();
-		if (!startLocalIso || !endLocalIso) {
+		const startLocalDate = localStart.toFormat('yyyy-LL-dd');
+		const endLocalDate = localEnd.toFormat('yyyy-LL-dd');
+		if (!startLocalDate || !endLocalDate) {
 			throw new Error('Failed to compute archive backfill range');
 		}
 
-		const buckets = await fetchArchiveDetail(INVERTER_BASE_URL, startLocalIso, endLocalIso);
+		const buckets = await fetchArchiveDetail(INVERTER_BASE_URL, startLocalDate, endLocalDate);
 		let upsertedCount = 0;
 
 		for (const bucket of buckets) {
@@ -1084,7 +1156,7 @@ async function backfillArchiveOnce() {
 		state.lastArchiveBackfillSuccessAtUtc = new Date().toISOString();
 		state.lastArchiveBackfillAtUtc = new Date().toISOString();
 		console.log(
-			`[archive] upserted ${upsertedCount} buckets for ${startLocalIso} -> ${endLocalIso} (${timezone})`,
+			`[archive] upserted ${upsertedCount} buckets for ${startLocalDate} -> ${endLocalDate} (${timezone})`,
 		);
 	} catch (error) {
 		state.lastArchiveBackfillError = error?.message || String(error);
@@ -1093,6 +1165,137 @@ async function backfillArchiveOnce() {
 	} finally {
 		state.archiveBackfillInProgress = false;
 	}
+}
+
+function getManualArchiveBackfillStatus() {
+	const status = state.manualArchiveBackfill;
+	return {
+		running: Boolean(status.running),
+		started_at_utc: status.startedAtUtc,
+		completed_at_utc: status.completedAtUtc,
+		last_error: status.lastError,
+		range: status.range,
+		progress: status.progress,
+	};
+}
+
+function buildManualArchiveBackfillRange(startMonth, months, timezone) {
+	if (typeof startMonth !== 'string' || !/^\d{4}-(0[1-9]|1[0-2])$/.test(startMonth)) {
+		throw new Error('start_month must be in YYYY-MM format');
+	}
+
+	const monthsNumber = Number(months);
+	if (!Number.isInteger(monthsNumber) || monthsNumber < 1 || monthsNumber > MANUAL_ARCHIVE_MAX_MONTHS) {
+		throw new Error(`months must be an integer in range 1..${MANUAL_ARCHIVE_MAX_MONTHS}`);
+	}
+
+	const startLocal = DateTime.fromFormat(`${startMonth}-01 00:00:00`, 'yyyy-LL-dd HH:mm:ss', { zone: timezone });
+	if (!startLocal.isValid) {
+		throw new Error(`Invalid start_month for timezone ${timezone}`);
+	}
+
+	const nowLocal = DateTime.now().setZone(timezone);
+	if (!nowLocal.isValid) {
+		throw new Error(`Invalid timezone for manual archive backfill: ${timezone}`);
+	}
+
+	if (startLocal > nowLocal) {
+		throw new Error('start_month cannot be in the future for the selected timezone');
+	}
+
+	const requestedEndLocal = startLocal.plus({ months: monthsNumber }).minus({ seconds: 1 });
+	const endLocal = requestedEndLocal < nowLocal ? requestedEndLocal : nowLocal;
+
+	const totalDays = Math.floor(endLocal.startOf('day').diff(startLocal.startOf('day'), 'days').days) + 1;
+	const totalRequests = Math.ceil(totalDays / MANUAL_ARCHIVE_CHUNK_DAYS);
+
+	return {
+		start_month: startMonth,
+		months: monthsNumber,
+		timezone,
+		start_local: startLocal.toISO({ suppressMilliseconds: true }),
+		end_local: endLocal.toISO({ suppressMilliseconds: true }),
+		total_days: totalDays,
+		total_requests: totalRequests,
+	};
+}
+
+async function runManualArchiveBackfillJob(range) {
+	const timezone = range.timezone || DEFAULT_TIMEZONE;
+	const startLocal = DateTime.fromISO(range.start_local, { zone: timezone });
+	const endLocal = DateTime.fromISO(range.end_local, { zone: timezone });
+
+	if (!startLocal.isValid || !endLocal.isValid || endLocal < startLocal) {
+		throw new Error('Invalid manual archive backfill range');
+	}
+
+	let chunkStart = startLocal.startOf('day');
+	let rowsUpserted = 0;
+	let completedDays = 0;
+	let completedRequests = 0;
+
+	while (chunkStart <= endLocal) {
+		const chunkStartedAtMs = Date.now();
+		const chunkEndCandidate = chunkStart.plus({ days: MANUAL_ARCHIVE_CHUNK_DAYS }).minus({ seconds: 1 });
+		const chunkEnd = chunkEndCandidate < endLocal ? chunkEndCandidate : endLocal;
+
+		const chunkStartDate = chunkStart.toFormat('yyyy-LL-dd');
+		const chunkEndDate = chunkEnd.toFormat('yyyy-LL-dd');
+		const buckets = await fetchArchiveDetail(INVERTER_BASE_URL, chunkStartDate, chunkEndDate);
+
+		let chunkUpserts = 0;
+		for (const bucket of buckets) {
+			const totalOffsetSeconds = Number.parseInt(String(bucket.offsetSeconds), 10);
+			if (!Number.isInteger(totalOffsetSeconds) || totalOffsetSeconds < 0) {
+				continue;
+			}
+
+			const bucketLocal = chunkStart.startOf('day').plus({ seconds: totalOffsetSeconds });
+			if (!bucketLocal.isValid || bucketLocal < startLocal || bucketLocal > endLocal) {
+				continue;
+			}
+
+			const tsUtc = bucketLocal.toUTC().toISO({ suppressMilliseconds: true });
+			if (!tsUtc) {
+				continue;
+			}
+
+			const result = statements.upsertEnergy5m.run({
+				ts_utc: tsUtc,
+				import_wh: bucket.importWh,
+				export_wh: bucket.exportWh,
+			});
+
+			if (result.changes > 0) {
+				chunkUpserts += 1;
+			}
+		}
+
+		rowsUpserted += chunkUpserts;
+		completedRequests += 1;
+
+		const chunkDays = Math.floor(chunkEnd.startOf('day').diff(chunkStart.startOf('day'), 'days').days) + 1;
+		completedDays = Math.min(range.total_days, completedDays + chunkDays);
+
+		state.manualArchiveBackfill.progress = {
+			total_days: range.total_days,
+			completed_days: completedDays,
+			total_requests: range.total_requests,
+			completed_requests: completedRequests,
+			rows_upserted: rowsUpserted,
+		};
+
+		const durationMs = Date.now() - chunkStartedAtMs;
+		console.log(
+			`[archive-manual] chunk ${chunkStartDate} -> ${chunkEndDate}, upserts=${chunkUpserts}, duration_ms=${durationMs}`,
+		);
+
+		chunkStart = chunkEnd.plus({ seconds: 1 }).startOf('day');
+	}
+
+	state.manualArchiveBackfill.lastError = null;
+	state.manualArchiveBackfill.completedAtUtc = new Date().toISOString();
+	state.manualArchiveBackfill.running = false;
 }
 
 async function pollOnce() {
@@ -1209,7 +1412,12 @@ async function fetchArchiveDetail(baseUrl, startLocalIso, endLocalIso) {
 			throw new Error(`Fronius archive API status error: ${payload?.Head?.Status?.Code}${statusReason ? ` ${statusReason}` : ''}`);
 		}
 
-		return parseArchiveDetail(payload);
+		try {
+			return parseArchiveDetail(payload);
+		} catch (error) {
+			console.error('[archive] failed to parse payload:', JSON.stringify(payload, null, 2));
+			throw error;
+		}
 	} finally {
 		clearTimeout(timeout);
 	}
