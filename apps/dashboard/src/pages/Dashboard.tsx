@@ -61,6 +61,7 @@ export function Dashboard() {
   const [lastLiveSuccessAt, setLastLiveSuccessAt] = useState<number | null>(null)
   const [lastLiveError, setLastLiveError] = useState<string | null>(null)
   const [nowMs, setNowMs] = useState(Date.now())
+  const [refreshKey, setRefreshKey] = useState(0)
 
   const isConnected = lastLiveSuccessAt !== null && nowMs - lastLiveSuccessAt <= 10000
 
@@ -96,6 +97,19 @@ export function Dashboard() {
 
     fetchInitialData()
   }, [])
+
+  useEffect(() => {
+    if (refreshKey === 0) return
+    async function refetchHistory() {
+      try {
+        const now = new Date()
+        const yesterday = subHours(now, 24)
+        const history = await getHistory(yesterday.toISOString(), now.toISOString())
+        setHistoryData(history)
+      } catch { /* ignore */ }
+    }
+    refetchHistory()
+  }, [refreshKey])
 
   useEffect(() => {
     const interval = setInterval(async () => {
@@ -260,9 +274,9 @@ export function Dashboard() {
           </div>
         )}
 
-        <BillEstimate freeImport={freeImport} />
+        <BillEstimate freeImport={freeImport} refreshKey={refreshKey} />
 
-        <BackfillPanel />
+        <BackfillPanel onComplete={() => setRefreshKey(k => k + 1)} />
 
         {rates && (
           <RatesEditor

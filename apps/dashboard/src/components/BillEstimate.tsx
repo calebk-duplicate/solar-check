@@ -42,9 +42,10 @@ function fmtDate(iso: string): string {
 
 interface BillEstimateProps {
   freeImport: boolean
+  refreshKey?: number
 }
 
-export function BillEstimate({ freeImport }: BillEstimateProps) {
+export function BillEstimate({ freeImport, refreshKey }: BillEstimateProps) {
   const [preset, setPreset] = useState<RangePreset>('last7')
   const [customFrom, setCustomFrom] = useState(format(startOfDay(subDays(new Date(), 7)), 'yyyy-MM-dd'))
   const [customTo, setCustomTo] = useState(format(new Date(), 'yyyy-MM-dd'))
@@ -70,7 +71,7 @@ export function BillEstimate({ freeImport }: BillEstimateProps) {
     if (preset === 'custom') return
     const { from, to } = getRangeForPreset(preset)
     fetchBill(from, to)
-  }, [preset, fetchBill])
+  }, [preset, fetchBill, refreshKey])
 
   function handlePreset(p: RangePreset) {
     setPreset(p)
